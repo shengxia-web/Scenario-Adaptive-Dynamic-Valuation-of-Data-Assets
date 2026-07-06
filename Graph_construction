@@ -1,0 +1,677 @@
+"""
+模块1：数据资产图构建 (graph_construction.py)
+论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
+功能：构造时间依赖的有向加权图 G_t = (V, E, X(t), E(t))
+包含节点类型：原始数据集、处理表、分析模型、ETL作业、数据管理员、业务应用
+节点特征：[质量, 访问频率, 业务贡献, 风险等级, 运营成本]
+边权重基于调用频率归一化 (公式1)
+"""
+
+import numpy as np
+import pandas as pd
+import networkx as nx
+from typing import Dict, List, Tuple, Optional, Union, Any
+from datetime import datetime
+import json
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+
+class GraphConstructor:
+    """
+    数据资产图构造器。
+    维护一个带时间戳的有向加权图，支持节点/边的增删改，特征更新，边权重计算和子图提取。
+    """
+
+    # 预定义的节点类型（论文3.1节）
+    NODE_TYPES = {
+        'RAW_DATASET': 'raw_dataset',
+        'PROCESSED_TABLE': 'processed_table',
+        'ANALYTICAL_MODEL': 'analytical_model',
+        'ETL_JOB': 'etl_job',
+        'DATA_STEWARD': 'data_steward',
+        'BUSINESS_APP': 'business_app'
+    }
+
+    # 预定义的边关系类型
+    EDGE_TYPES = {
+        'LINEAGE': 'lineage',            # 血缘依赖
+        'INVOCATION': 'invocation',      # 调用/消费
+        'GOVERNANCE': 'governance'       # 治理控制
+    }
+
+    # 节点特征名称（论文公式(2)中的维度）
+    QUALITY_DIMENSIONS = ['completeness', 'accuracy', 'timeliness']
+
+    def __init__(self, graph_id: str = None, storage_dir: str = None):
+        """
+        初始化图构造器。
+
+        Args:
+            graph_id: 图标识符（可选）
+            storage_dir: 持久化存储目录（可选）
+        """
+        self.graph_id = graph_id or f"DLG_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.storage_dir = storage_dir
+        if storage_dir:
+            os.makedirs(storage_dir, exist_ok=True)
+
+        # 底层图结构：NetworkX DiGraph，支持时间序列属性
+        self._graph = nx.DiGraph()
+
+        # 时间序列特征存储：{node_id: {timestamp: feature_vector}}
+        self._node_features_ts = {}
+
+        # 边权重时间序列：{(src, dst): {timestamp: weight}}
+        self._edge_weights_ts = {}
+
+        # 当前时间戳
+        self._current_timestamp = 0
+
+        # 特征统计信息（用于标准化等）
+        self._feature_stats = {}
+
+        # 节点类型映射
+        self._node_types = {}
+
+        # 边类型映射
+        self._edge_types = {}
+
+        # 质量维度权重（论文公式2中的w_k）
+        self._quality_weights = {
+            'completeness': 0.4,
+            'accuracy': 0.35,
+            'timeliness': 0.25
+        }
+
+    # ==================== 节点管理 ====================
+
+    def add_node(self,
+                 node_id: Union[str, int],
+                 node_type: str,
+                 attributes: Dict[str, Union[float, int, str]],
+                 timestamp: Optional[int] = None,
+                 **kwargs) -> bool:
+        """
+        添加节点到图，并记录其初始特征。
+
+        Args:
+            node_id: 节点唯一标识
+            node_type: 节点类型（必须为NODE_TYPES中定义的类型）
+            attributes: 节点属性字典，必须包含:
+                - quality: 质量指标字典 {'completeness':, 'accuracy':, 'timeliness':} 或综合质量分数
+                - access_freq: 访问频率
+                - business_contrib: 业务贡献
+                - risk: 风险等级
+                - cost: 运营成本
+                若quality为字典，则自动计算综合质量（公式2）
+            timestamp: 时间戳（整数），默认为当前递增时间
+            kwargs: 其他节点属性（如owner, description等）
+
+        Returns:
+            bool: 添加成功返回True
+        """
+        if node_type not in self.NODE_TYPES.values():
+            raise ValueError(f"节点类型 {node_type} 不在允许列表中: {list(self.NODE_TYPES.values())}")
+
+        if timestamp is None:
+            timestamp = self._get_next_timestamp()
+
+        # 提取并验证特征
+        feature_vector = self._extract_feature_vector(attributes)
+        if feature_vector is None:
+            print(f"警告: 节点 {node_id} 缺少必要的特征，跳过添加")
+            return False
+
+        # 添加节点到图（基础属性）
+        self._graph.add_node(node_id,
+                             node_type=node_type,
+                             created_at=timestamp,
+                             **kwargs)
+
+        # 记录节点类型
+        self._node_types[node_id] = node_type
+
+        # 存储时间序列特征
+        if node_id not in self._node_features_ts:
+            self._node_features_ts[node_id] = {}
+        self._node_features_ts[node_id][timestamp] = feature_vector
+
+        # 更新当前节点特征（Graph的属性）
+        self._graph.nodes[node_id]['features'] = feature_vector
+        self._graph.nodes[node_id]['last_update'] = timestamp
+
+        # 更新全局时间戳
+        if timestamp > self._current_timestamp:
+            self._current_timestamp = timestamp
+
+        return True
+
+    def update_node_features(self,
+                             node_id: Union[str, int],
+                             new_features: Dict[str, float],
+                             timestamp: Optional[int] = None) -> bool:
+        """
+        更新节点特征（随时间演变）。
+
+        Args:
+            node_id: 节点ID
+            new_features: 新特征字典，可包含 'quality', 'access_freq', 'business_contrib', 'risk', 'cost'
+            timestamp: 时间戳，默认为当前时间
+
+        Returns:
+            bool: 更新成功返回True
+        """
+        if node_id not in self._graph.nodes:
+            raise ValueError(f"节点 {node_id} 不存在")
+
+        if timestamp is None:
+            timestamp = self._get_next_timestamp()
+
+        # 获取现有特征向量
+        current_vec = self._graph.nodes[node_id].get('features', np.zeros(5))
+        # 更新部分特征
+        feature_vec = self._extract_feature_vector(new_features, default=current_vec)
+        if feature_vec is None:
+            return False
+
+        # 存储新特征
+        if node_id not in self._node_features_ts:
+            self._node_features_ts[node_id] = {}
+        self._node_features_ts[node_id][timestamp] = feature_vec
+
+        # 更新图属性
+        self._graph.nodes[node_id]['features'] = feature_vec
+        self._graph.nodes[node_id]['last_update'] = timestamp
+
+        if timestamp > self._current_timestamp:
+            self._current_timestamp = timestamp
+
+        return True
+
+    def _extract_feature_vector(self, attributes: Dict, default: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+        """
+        从属性字典中提取标准化特征向量 [q, f, c, r, cost]
+
+        Args:
+            attributes: 包含特征的字典
+            default: 若缺失部分特征时使用的默认向量
+
+        Returns:
+            np.ndarray: 5维特征向量，或None
+        """
+        # 处理质量指标
+        quality = attributes.get('quality')
+        if isinstance(quality, dict):
+            # 质量是维度字典，按公式(2)计算综合质量
+            q_score = 0.0
+            for dim, weight in self._quality_weights.items():
+                dim_val = quality.get(dim, 0.0)
+                # 假设维度值在[0,1]范围内
+                q_score += weight * dim_val
+            # 裁剪到[0,1]
+            q_score = np.clip(q_score, 0.0, 1.0)
+        elif isinstance(quality, (int, float)):
+            q_score = float(quality)
+        else:
+            # 尝试从attributes中直接提取质量维度
+            q_score = 0.0
+            for dim, weight in self._quality_weights.items():
+                dim_val = attributes.get(dim, None)
+                if dim_val is not None:
+                    q_score += weight * float(dim_val)
+            if q_score == 0.0 and default is not None:
+                q_score = default[0]  # 使用默认
+            else:
+                q_score = np.clip(q_score, 0.0, 1.0)
+
+        # 其他特征
+        access_freq = float(attributes.get('access_freq', default[1] if default is not None else 0.0))
+        business_contrib = float(attributes.get('business_contrib', default[2] if default is not None else 0.0))
+        risk = float(attributes.get('risk', default[3] if default is not None else 0.0))
+        cost = float(attributes.get('cost', default[4] if default is not None else 0.0))
+
+        # 构建向量
+        return np.array([q_score, access_freq, business_contrib, risk, cost], dtype=np.float64)
+
+    def remove_node(self, node_id: Union[str, int]) -> bool:
+        """移除节点及其所有关联边。"""
+        if node_id not in self._graph.nodes:
+            return False
+        self._graph.remove_node(node_id)
+        if node_id in self._node_features_ts:
+            del self._node_features_ts[node_id]
+        if node_id in self._node_types:
+            del self._node_types[node_id]
+        # 清理边时间序列
+        for key in list(self._edge_weights_ts.keys()):
+            if key[0] == node_id or key[1] == node_id:
+                del self._edge_weights_ts[key]
+        return True
+
+    # ==================== 边管理 ====================
+
+    def add_edge(self,
+                 source: Union[str, int],
+                 target: Union[str, int],
+                 relation_type: str,
+                 weight: Optional[float] = None,
+                 call_freq: Optional[float] = None,
+                 timestamp: Optional[int] = None,
+                 **kwargs) -> bool:
+        """
+        添加有向边，支持关系类型和权重。
+
+        Args:
+            source: 源节点ID
+            target: 目标节点ID
+            relation_type: 关系类型（EDGE_TYPES中定义）
+            weight: 直接指定边权重（若为None则根据call_freq自动计算，需后续调用compute_edge_weights）
+            call_freq: 调用频率（用于计算权重）
+            timestamp: 时间戳
+            kwargs: 其他边属性
+
+        Returns:
+            bool: 添加成功返回True
+        """
+        if source not in self._graph.nodes or target not in self._graph.nodes:
+            raise ValueError(f"源节点或目标节点不存在: {source} -> {target}")
+
+        if relation_type not in self.EDGE_TYPES.values():
+            raise ValueError(f"关系类型 {relation_type} 不在允许列表中: {list(self.EDGE_TYPES.values())}")
+
+        if timestamp is None:
+            timestamp = self._get_next_timestamp()
+
+        # 添加边到图
+        self._graph.add_edge(source, target,
+                             relation_type=relation_type,
+                             created_at=timestamp,
+                             call_freq=call_freq if call_freq is not None else 1.0,
+                             **kwargs)
+
+        # 记录边类型
+        self._edge_types[(source, target)] = relation_type
+
+        # 存储边权重（若指定）
+        if weight is not None:
+            self._set_edge_weight(source, target, weight, timestamp)
+        else:
+            # 暂存call_freq，后续计算权重
+            if (source, target) not in self._edge_weights_ts:
+                self._edge_weights_ts[(source, target)] = {}
+            # 先存入call_freq，待compute_edge_weights时归一化
+            self._edge_weights_ts[(source, target)][timestamp] = call_freq if call_freq is not None else 1.0
+
+        if timestamp > self._current_timestamp:
+            self._current_timestamp = timestamp
+
+        return True
+
+    def _set_edge_weight(self, src, dst, weight, timestamp):
+        """内部方法：设置边权重时间序列"""
+        if (src, dst) not in self._edge_weights_ts:
+            self._edge_weights_ts[(src, dst)] = {}
+        self._edge_weights_ts[(src, dst)][timestamp] = weight
+        # 更新图属性
+        if self._graph.has_edge(src, dst):
+            self._graph.edges[src, dst]['weight'] = weight
+            self._graph.edges[src, dst]['last_update'] = timestamp
+
+    def compute_edge_weights(self, timestamp: Optional[int] = None) -> None:
+        """
+        根据论文公式(1)计算边权重：
+        w_ij(t) = F_ij(t) / max_{p,q} F_pq(t)
+
+        对所有边在当前时间戳（或指定时间戳）的调用频率进行归一化。
+        若timestamp未指定，则使用最新可用数据。
+        """
+        if timestamp is None:
+            # 使用当前全局时间戳
+            timestamp = self._current_timestamp
+
+        # 收集所有边在当前时间戳的调用频率
+        freq_values = []
+        edge_keys = []
+        for (src, dst), ts_dict in self._edge_weights_ts.items():
+            # 查找最接近timestamp的调用频率
+            freq = self._get_closest_value(ts_dict, timestamp, default=1.0)
+            # 但ts_dict中可能存储的是原始调用频率，也可能是已经归一化的权重，我们需区分。
+            # 我们约定：如果存储的是调用频率（call_freq），则使用；若已存在weight，则使用weight。
+            # 实际实现中，我们单独存储call_freq和weight。
+            # 为简化，我们这里检查边属性是否有'call_freq'字段
+            if self._graph.has_edge(src, dst):
+                edge_data = self._graph.edges[src, dst]
+                cf = edge_data.get('call_freq', 1.0)
+                freq_values.append(cf)
+                edge_keys.append((src, dst))
+            else:
+                # 若边已被删除，跳过
+                continue
+
+        if not freq_values:
+            print("没有边可计算权重")
+            return
+
+        max_freq = max(freq_values)
+        if max_freq == 0:
+            max_freq = 1.0
+
+        # 归一化并更新
+        for (src, dst), freq in zip(edge_keys, freq_values):
+            weight = freq / max_freq
+            # 裁剪到[0,1]
+            weight = np.clip(weight, 0.0, 1.0)
+            self._set_edge_weight(src, dst, weight, timestamp)
+            # 同时更新图的边属性
+            if self._graph.has_edge(src, dst):
+                self._graph.edges[src, dst]['weight'] = weight
+
+    def _get_closest_value(self, ts_dict: Dict[int, Any], timestamp: int, default: Any = None) -> Any:
+        """获取时间序列字典中距timestamp最近的值"""
+        if not ts_dict:
+            return default
+        if timestamp in ts_dict:
+            return ts_dict[timestamp]
+        # 查找最近的时间戳
+        times = list(ts_dict.keys())
+        closest = min(times, key=lambda t: abs(t - timestamp))
+        return ts_dict[closest]
+
+    # ==================== 子图提取 ====================
+
+    def extract_subgraph(self,
+                         node_ids: List[Union[str, int]],
+                         include_neighbors: bool = False,
+                         depth: int = 1,
+                         timestamp: Optional[int] = None) -> nx.DiGraph:
+        """
+        提取包含指定节点的子图。
+
+        Args:
+            node_ids: 节点ID列表
+            include_neighbors: 是否包含邻居节点
+            depth: 邻居扩展深度（当include_neighbors=True时生效）
+            timestamp: 提取该时间戳对应的特征和权重（若为None则使用最新）
+
+        Returns:
+            nx.DiGraph: 子图（复制），包含相关节点和边，特征为指定时间戳的版本
+        """
+        if timestamp is None:
+            timestamp = self._current_timestamp
+
+        # 获取目标节点集合
+        target_nodes = set(node_ids)
+        if include_neighbors:
+            # BFS扩展
+            frontier = set(target_nodes)
+            for _ in range(depth):
+                new_nodes = set()
+                for node in frontier:
+                    # 出邻
+                    successors = list(self._graph.successors(node))
+                    predecessors = list(self._graph.predecessors(node))
+                    new_nodes.update(successors)
+                    new_nodes.update(predecessors)
+                target_nodes.update(new_nodes)
+                frontier = new_nodes
+
+        # 提取子图
+        subgraph = self._graph.subgraph(target_nodes).copy()
+
+        # 更新子图节点特征为指定时间戳的特征
+        for node in subgraph.nodes:
+            features = self.get_node_features(node, timestamp)
+            if features is not None:
+                subgraph.nodes[node]['features'] = features
+            # 添加节点类型
+            subgraph.nodes[node]['node_type'] = self._node_types.get(node, 'unknown')
+
+        # 更新子图边权重为指定时间戳的权重
+        for src, dst in subgraph.edges:
+            weight = self.get_edge_weight(src, dst, timestamp)
+            if weight is not None:
+                subgraph.edges[src, dst]['weight'] = weight
+
+        return subgraph
+
+    # ==================== 查询接口 ====================
+
+    def get_node_features(self, node_id: Union[str, int], timestamp: Optional[int] = None) -> Optional[np.ndarray]:
+        """获取节点在特定时间戳的特征向量"""
+        if node_id not in self._node_features_ts:
+            return None
+        if timestamp is None:
+            timestamp = self._current_timestamp
+        ts_dict = self._node_features_ts[node_id]
+        if not ts_dict:
+            return None
+        if timestamp in ts_dict:
+            return ts_dict[timestamp]
+        # 否则返回最近时间戳的特征
+        times = list(ts_dict.keys())
+        closest = min(times, key=lambda t: abs(t - timestamp))
+        return ts_dict[closest]
+
+    def get_edge_weight(self, src, dst, timestamp: Optional[int] = None) -> Optional[float]:
+        """获取边在特定时间戳的权重"""
+        if (src, dst) not in self._edge_weights_ts:
+            return None
+        if timestamp is None:
+            timestamp = self._current_timestamp
+        ts_dict = self._edge_weights_ts[(src, dst)]
+        if not ts_dict:
+            return None
+        if timestamp in ts_dict:
+            return ts_dict[timestamp]
+        times = list(ts_dict.keys())
+        closest = min(times, key=lambda t: abs(t - timestamp))
+        return ts_dict[closest]
+
+    def get_current_graph(self) -> nx.DiGraph:
+        """返回当前完整图（包含最新特征和权重）"""
+        return self._graph
+
+    def get_graph_at_time(self, timestamp: int) -> nx.DiGraph:
+        """返回指定时间戳的快照图（特征和权重为当时的值）"""
+        return self.extract_subgraph(list(self._graph.nodes), include_neighbors=False, timestamp=timestamp)
+
+    # ==================== 工具方法 ====================
+
+    def _get_next_timestamp(self) -> int:
+        """生成下一个时间戳（递增）"""
+        self._current_timestamp += 1
+        return self._current_timestamp
+
+    def load_from_dataframe(self,
+                            nodes_df: pd.DataFrame,
+                            edges_df: pd.DataFrame,
+                            time_series_df: Optional[pd.DataFrame] = None):
+        """
+        从DataFrame批量加载节点和边。
+        此方法模拟从企业元数据库、日志等提取数据后的批量导入。
+
+        Args:
+            nodes_df: 节点表，必须包含列: node_id, node_type, quality, access_freq, business_contrib, risk, cost
+            edges_df: 边表，必须包含: source, target, relation_type, call_freq (可选)
+            time_series_df: 时间序列特征表（可选），列: node_id, timestamp, quality, access_freq, ...
+        """
+        # 先添加节点
+        for _, row in nodes_df.iterrows():
+            node_id = row['node_id']
+            node_type = row['node_type']
+            # 提取质量维度（假设有相关列）
+            quality_dict = {}
+            for dim in self.QUALITY_DIMENSIONS:
+                if dim in row:
+                    quality_dict[dim] = row[dim]
+                else:
+                    # 若没有单独维度，尝试使用'quality'列
+                    if 'quality' in row:
+                        quality_dict = row['quality']
+                        break
+            attributes = {
+                'quality': quality_dict if quality_dict else row.get('quality', 0.5),
+                'access_freq': row.get('access_freq', 0.0),
+                'business_contrib': row.get('business_contrib', 0.0),
+                'risk': row.get('risk', 0.0),
+                'cost': row.get('cost', 0.0)
+            }
+            self.add_node(node_id, node_type, attributes, timestamp=row.get('timestamp', 0))
+
+        # 添加边
+        for _, row in edges_df.iterrows():
+            src = row['source']
+            dst = row['target']
+            rel_type = row.get('relation_type', self.EDGE_TYPES['LINEAGE'])
+            call_freq = row.get('call_freq', 1.0)
+            self.add_edge(src, dst, rel_type, call_freq=call_freq, timestamp=row.get('timestamp', 0))
+
+        # 如果有时间序列，则更新节点特征
+        if time_series_df is not None:
+            for _, row in time_series_df.iterrows():
+                node_id = row['node_id']
+                timestamp = row['timestamp']
+                features = {
+                    'quality': row.get('quality', None),
+                    'access_freq': row.get('access_freq', None),
+                    'business_contrib': row.get('business_contrib', None),
+                    'risk': row.get('risk', None),
+                    'cost': row.get('cost', None)
+                }
+                self.update_node_features(node_id, features, timestamp)
+
+        # 最后计算边权重
+        self.compute_edge_weights()
+
+    # ==================== 持久化 ====================
+
+    def save(self, filepath: Optional[str] = None) -> str:
+        """将图结构、特征时间序列保存为文件（支持JSON格式）"""
+        if filepath is None:
+            if self.storage_dir:
+                filepath = os.path.join(self.storage_dir, f"{self.graph_id}.json")
+            else:
+                filepath = f"{self.graph_id}.json"
+
+        data = {
+            'graph_id': self.graph_id,
+            'current_timestamp': self._current_timestamp,
+            'nodes': [],
+            'edges': [],
+            'node_features_ts': {},
+            'edge_weights_ts': {},
+            'node_types': self._node_types,
+            'edge_types': {f"{k[0]}_{k[1]}": v for k, v in self._edge_types.items()}
+        }
+
+        # 节点
+        for node, attrs in self._graph.nodes(data=True):
+            node_data = {'id': node, **attrs}
+            # 将numpy数组转换为列表
+            if 'features' in node_data:
+                node_data['features'] = node_data['features'].tolist()
+            data['nodes'].append(node_data)
+
+        # 边
+        for src, dst, attrs in self._graph.edges(data=True):
+            edge_data = {'source': src, 'target': dst, **attrs}
+            data['edges'].append(edge_data)
+
+        # 特征时间序列
+        for nid, ts_dict in self._node_features_ts.items():
+            data['node_features_ts'][str(nid)] = {str(t): vec.tolist() for t, vec in ts_dict.items()}
+
+        # 边权重时间序列
+        for (src, dst), ts_dict in self._edge_weights_ts.items():
+            key = f"{src}_{dst}"
+            data['edge_weights_ts'][key] = {str(t): w for t, w in ts_dict.items()}
+
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=2)
+
+        print(f"图已保存至: {filepath}")
+        return filepath
+
+    def load(self, filepath: str):
+        """从文件加载图"""
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+
+        self.graph_id = data['graph_id']
+        self._current_timestamp = data['current_timestamp']
+
+        # 重建图
+        self._graph = nx.DiGraph()
+        for node_data in data['nodes']:
+            nid = node_data.pop('id')
+            features = node_data.pop('features', None)
+            if features is not None:
+                node_data['features'] = np.array(features)
+            self._graph.add_node(nid, **node_data)
+
+        for edge_data in data['edges']:
+            src = edge_data.pop('source')
+            dst = edge_data.pop('target')
+            self._graph.add_edge(src, dst, **edge_data)
+
+        # 恢复时间序列
+        self._node_features_ts = {}
+        for nid_str, ts_dict in data['node_features_ts'].items():
+            nid = int(nid_str) if nid_str.isdigit() else nid_str
+            self._node_features_ts[nid] = {int(t): np.array(vec) for t, vec in ts_dict.items()}
+
+        self._edge_weights_ts = {}
+        for key_str, ts_dict in data['edge_weights_ts'].items():
+            src, dst = key_str.split('_')
+            src = int(src) if src.isdigit() else src
+            dst = int(dst) if dst.isdigit() else dst
+            self._edge_weights_ts[(src, dst)] = {int(t): w for t, w in ts_dict.items()}
+
+        self._node_types = data['node_types']
+        self._edge_types = {tuple(k.split('_')): v for k, v in data['edge_types'].items()}
+
+if __name__ == "__main__":
+    print("数据资产图构建模块测试")
+
+    # 创建构造器
+    constructor = GraphConstructor(graph_id="DLG_Demo", storage_dir="./demo_graph")
+
+    # 从企业元数据加载的DataFrame
+    nodes_data = {
+        'node_id': ['raw_sales', 'dim_customer', 'fact_orders', 'etl_sales', 'steward1', 'app_bi'],
+        'node_type': ['raw_dataset', 'processed_table', 'processed_table', 'etl_job', 'data_steward', 'business_app'],
+        'quality': [0.8, 0.9, 0.85, 0.7, 0.95, 0.9],
+        'access_freq': [100, 500, 300, 50, 10, 200],
+        'business_contrib': [0.2, 0.5, 0.7, 0.1, 0.0, 0.3],
+        'risk': [0.3, 0.2, 0.4, 0.1, 0.0, 0.2],
+        'cost': [10.5, 5.2, 8.1, 3.0, 1.0, 4.5]
+    }
+    nodes_df = pd.DataFrame(nodes_data)
+
+    edges_data = {
+        'source': ['raw_sales', 'dim_customer', 'fact_orders', 'raw_sales', 'fact_orders'],
+        'target': ['dim_customer', 'fact_orders', 'app_bi', 'fact_orders', 'etl_sales'],
+        'relation_type': ['lineage', 'lineage', 'invocation', 'lineage', 'governance'],
+        'call_freq': [10, 20, 5, 15, 2]
+    }
+    edges_df = pd.DataFrame(edges_data)
+
+    # 批量加载
+    constructor.load_from_dataframe(nodes_df, edges_df)
+
+    # 打印图信息
+    print(f"节点数: {constructor._graph.number_of_nodes()}, 边数: {constructor._graph.number_of_edges()}")
+
+    # 提取子图
+    subgraph = constructor.extract_subgraph(['raw_sales', 'dim_customer'], include_neighbors=True, depth=1)
+    print(f"子图节点: {list(subgraph.nodes)}")
+
+    # 保存
+    constructor.save()
+
+    # 加载
+    new_constructor = GraphConstructor()
+    new_constructor.load("demo_graph/DLG_Demo.json")
+    print("加载成功")
