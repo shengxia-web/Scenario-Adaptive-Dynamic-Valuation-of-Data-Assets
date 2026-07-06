@@ -1,0 +1,360 @@
+"""
+DataAssetGraphData (DLG-DR-23) 预处理全流程
+论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
+"""
+
+import os
+import json
+import numpy as np
+import pandas as pd
+from scipy.stats import zscore
+from typing import Dict, List, Tuple, Optional
+from sklearn.model_selection import train_test_split
+import torch
+from torch_geometric.data import Data, Dataset
+from torch_geometric.utils import from_networkx
+import networkx as nx
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==================== 1. 配置路径和参数 ====================
+DATA_ROOT = "./data/DLG-DR-23"          # 原始数据根目录
+OUTPUT_ROOT = "./processed/DLG-DR-23"   # 处理后输出目录
+MISSING_THRESHOLD = 0.5                 # 缺失率阈值（>50%则过滤）
+TIME_SPLIT_RATIO = 0.8                  # 训练集比例（按时间顺序）
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+
+# 统一的本体特征字段（按论文定义）
+UNIFIED_FEATURES = ['quality', 'access_freq', 'business_contrib', 'risk', 'cost']
+# 长尾分布特征（通常访问频率、成本等可能呈长尾）
+LONG_TAIL_FEATURES = ['access_freq', 'cost']
+
+# ==================== 2. 数据加载函数（模拟真实文件结构） ====================
+def load_raw_data(dlg_id: str) -> Dict:
+    """
+    加载单个DLG的原始数据文件。
+    假设每个DLG文件夹包含：
+      - nodes.csv: 节点列表，列：node_id, node_type, quality, access_freq, business_contrib, risk, cost, ...
+      - edges.csv: 边列表，列：src, dst, edge_type, call_freq (用于计算权重)
+      - time_series.csv: 时间序列特征（按时间步），列：timestamp, node_id, quality, access_freq, ...
+    实际数据格式可能与假设不同，此处仅为示例结构。
+    """
+    dlg_path = os.path.join(DATA_ROOT, dlg_id)
+    nodes_df = pd.read_csv(os.path.join(dlg_path, 'nodes.csv'))
+    edges_df = pd.read_csv(os.path.join(dlg_path, 'edges.csv'))
+    # 时间序列文件（可选，若无则从静态特征复制）
+    ts_path = os.path.join(dlg_path, 'time_series.csv')
+    if os.path.exists(ts_path):
+        ts_df = pd.read_csv(ts_path)
+    else:
+        # 若没有时间序列，则模拟一个时间步（t=0）
+        ts_df = nodes_df.copy()
+        ts_df['timestamp'] = 0
+    return {'nodes': nodes_df, 'edges': edges_df, 'time_series': ts_df}
+
+# ==================== 3. 统一Schema映射 ====================
+def map_schema(nodes_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    将原始节点列名映射到统一特征名。
+    由于数据集来源可能有多样字段名，此处根据论文描述进行映射。
+    实际需根据数据字典调整。
+    """
+    # 假设原始列名可能是：'quality_score', 'access_count', 'business_value', 'risk_level', 'storage_cost'
+    mapping = {
+        'quality_score': 'quality',
+        'access_count': 'access_freq',
+        'business_value': 'business_contrib',
+        'risk_level': 'risk',
+        'storage_cost': 'cost',
+        # 若原始已是统一名则直接保留
+    }
+    # 仅重命名存在的列
+    for old, new in mapping.items():
+        if old in nodes_df.columns:
+            nodes_df.rename(columns={old: new}, inplace=True)
+    # 确保所有统一特征都存在，缺失的用NaN填充
+    for feat in UNIFIED_FEATURES:
+        if feat not in nodes_df.columns:
+            nodes_df[feat] = np.nan
+    return nodes_df
+
+# ==================== 4. 缺失值处理与过滤 ====================
+def filter_by_missing(nodes_df: pd.DataFrame, threshold: float = MISSING_THRESHOLD) -> pd.DataFrame:
+    """
+    删除缺失率超过threshold的节点（资产）。
+    缺失率按所有统一特征计算。
+    """
+    feature_cols = [f for f in UNIFIED_FEATURES if f in nodes_df.columns]
+    if not feature_cols:
+        raise ValueError("No unified features found for missing rate calculation.")
+    missing_rate = nodes_df[feature_cols].isnull().mean(axis=1)
+    keep_mask = missing_rate <= threshold
+    filtered = nodes_df[keep_mask].copy()
+    dropped = nodes_df[~keep_mask]
+    print(f"过滤前节点数: {len(nodes_df)}, 过滤后: {len(filtered)}, 丢弃: {len(dropped)}")
+    return filtered
+
+# ==================== 5. 特征工程：对数变换 + Z-score标准化 ====================
+def transform_features(nodes_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    对长尾特征进行对数变换（log1p），然后对所有统一特征进行Z-score标准化。
+    返回标准化后的DataFrame，同时保留node_id等非特征列。
+    """
+    df = nodes_df.copy()
+    # 对数变换（对非负特征）
+    for feat in LONG_TAIL_FEATURES:
+        if feat in df.columns:
+            # 确保非负（若存在负值则加偏移）
+            min_val = df[feat].min()
+            if min_val < 0:
+                df[feat] = df[feat] - min_val + 1e-6
+            df[feat] = np.log1p(df[feat])
+    # Z-score标准化（仅对统一特征）
+    feature_cols = [f for f in UNIFIED_FEATURES if f in df.columns]
+    # 处理缺失值：用中位数填充（避免标准化时出错）
+    for col in feature_cols:
+        median_val = df[col].median()
+        df[col].fillna(median_val, inplace=True)
+    # 标准化
+    for col in feature_cols:
+        mean = df[col].mean()
+        std = df[col].std()
+        if std == 0:
+            std = 1.0
+        df[col] = (df[col] - mean) / std
+    return df
+
+# ==================== 6. 时间序列构建 ====================
+def build_time_series(ts_df: pd.DataFrame, nodes_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    构建完整的时间序列特征矩阵。
+    如果原始ts_df只包含部分节点或部分时间步，则与nodes_df合并补全。
+    输出格式：每行包含 node_id, timestamp, 及所有统一特征。
+    """
+    # 确保包含所有节点
+    all_nodes = nodes_df['node_id'].unique()
+    if 'timestamp' not in ts_df.columns:
+        ts_df['timestamp'] = 0
+    # 若ts_df缺失某些节点，则用nodes_df的静态特征填充（假设t=0）
+    merged = pd.merge(ts_df, nodes_df[['node_id'] + UNIFIED_FEATURES], on='node_id', how='outer')
+    # 对于ts_df中已有的特征列，保留；否则用nodes_df填充
+    for feat in UNIFIED_FEATURES:
+        if feat in ts_df.columns:
+            # 若ts_df已有该列，则优先使用，缺失则用nodes_df补充
+            if feat in merged.columns:
+                # 列名可能冲突，使用后缀
+                pass
+        else:
+            # 若ts_df没有该列，从nodes_df复制
+            merged[feat] = merged[feat + '_y'] if feat + '_y' in merged.columns else np.nan
+    # 简化处理：仅保留node_id, timestamp, 以及特征列（去重）
+    feature_cols = [f for f in UNIFIED_FEATURES if f in merged.columns]
+    # 确保没有重复列
+    keep_cols = ['node_id', 'timestamp'] + feature_cols
+    merged = merged[keep_cols].drop_duplicates(subset=['node_id', 'timestamp'])
+    # 按时间排序
+    merged = merged.sort_values(['timestamp', 'node_id']).reset_index(drop=True)
+    return merged
+
+# ==================== 7. 边权重计算（基于调用频率） ====================
+def compute_edge_weights(edges_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    根据论文公式(1): w_ij(t) = F_ij(t) / max_{p,q} F_pq(t)
+    假设edges_df包含列：src, dst, call_freq（或类似），也可能包含timestamp。
+    若没有call_freq，则默认设为1。
+    """
+    df = edges_df.copy()
+    if 'call_freq' not in df.columns:
+        df['call_freq'] = 1.0
+    # 若存在时间维度，则按时间步分别归一化（此处假设全局归一化）
+    max_freq = df['call_freq'].max()
+    if max_freq == 0:
+        max_freq = 1.0
+    df['weight'] = df['call_freq'] / max_freq
+    # 裁剪到[0,1]
+    df['weight'] = df['weight'].clip(0, 1)
+    return df
+
+# ==================== 8. 时间切分（按时间顺序） ====================
+def temporal_split(timestamps: np.ndarray, train_ratio: float = TIME_SPLIT_RATIO) -> Tuple[int, int]:
+    """
+    按时间顺序切分，返回训练集和测试集的索引分割点。
+    假设timestamps已排序。
+    """
+    unique_times = np.sort(np.unique(timestamps))
+    split_idx = int(len(unique_times) * train_ratio)
+    train_times = unique_times[:split_idx]
+    test_times = unique_times[split_idx:]
+    return train_times, test_times
+
+# ==================== 9. 构建PyG Data对象（单图） ====================
+def build_pyg_data(nodes_df: pd.DataFrame, edges_df: pd.DataFrame, 
+                   train_times: np.ndarray, test_times: np.ndarray) -> Dict[str, Data]:
+    """
+    为训练和测试分别构建PyG Data对象。
+    节点特征：统一特征（已经标准化）
+    边索引：from src to dst
+    边权重：已经归一化
+    时间戳：每个节点在每个时间步的特征可能不同，但PyG通常每个节点一个特征向量。
+    论文模型使用了时间序列RNN，因此需要按时间步展开。
+    这里为简化，我们将每个时间步的节点特征作为节点属性，并保留时间信息。
+    实际动态处理需按时间步拆分，但本预处理仅构建静态图结构，时间序列在模型内处理。
+    """
+    # 构建图结构（节点和边是静态的，但特征随时间变化）
+    # 此处以节点在最后一个时间步的特征为例，但实际应保留所有时间步。
+    # 更合理的方式是返回按时间步拆分的Data列表，或使用动态图。
+    # 为演示，我们构建静态图，但附加时间特征矩阵（node_features_per_time）
+    # 方法：将所有时间步的特征拼接为 [num_nodes, num_timesteps, num_features]
+    # 但PyG的Data.x要求2D，所以我们选择最后一个时间步作为静态图特征，同时保留时间序列作为额外属性。
+    # 论文实验中，模型使用了时序建模，所以预处理应输出每个节点的特征序列。
+    # 因此，我们将构建一个包含所有时间步特征的数据结构。
+    # 更简洁：将所有节点按时间展开（即复制节点），但这样图结构会膨胀。
+    # 实际论文中可能直接使用时序边或时间窗口，我们按常见做法：每个节点有一个特征矩阵（时间×特征）。
+    # 为了兼容PyG，我们采用两种方式：
+    # 方式A：每个时间步构建一个图，存入列表。
+    # 方式B：将所有时间步的特征作为节点特征，并增加时间节点。
+    # 论文中模型是GNN+RNN，故更合适的是方式A。
+    
+    # 选择方式A：按时间步分割，每个时间步一个Data对象。
+    all_times = np.sort(np.unique(nodes_df['timestamp'].values if 'timestamp' in nodes_df.columns else [0]))
+    # 若节点特征不随时间变化，则所有时间步相同，但我们可以复制。
+    # 实际数据中，时间序列文件提供了每个时间步的特征。
+    # 我们假设nodes_df已经包含'timestamp'列。
+    data_by_time = {}
+    for t in all_times:
+        # 获取该时间步的节点特征
+        if 'timestamp' in nodes_df.columns:
+            node_sub = nodes_df[nodes_df['timestamp'] == t].copy()
+        else:
+            node_sub = nodes_df.copy()
+            node_sub['timestamp'] = t
+        # 对边，若边权重随时间变化，则需按时间过滤，这里假设静态边权重
+        edge_sub = edges_df.copy()
+        # 构建图
+        g = nx.DiGraph()
+        # 添加节点（特征）
+        for _, row in node_sub.iterrows():
+            node_id = row['node_id']
+            features = row[UNIFIED_FEATURES].values.astype(np.float32)
+            g.add_node(node_id, x=features)
+        # 添加边
+        for _, row in edge_sub.iterrows():
+            src, dst = row['src'], row['dst']
+            weight = row['weight']
+            g.add_edge(src, dst, weight=weight)
+        # 转换为PyG Data
+        data = from_networkx(g, group_node_attrs=['x'], group_edge_attrs=['weight'])
+        # 添加时间戳信息
+        data.t = torch.tensor(t, dtype=torch.long)
+        # 添加节点ID映射（可选）
+        data.node_ids = torch.tensor(list(g.nodes()), dtype=torch.long)
+        data_by_time[t] = data
+    # 按时间划分训练/测试
+    train_data_list = [data_by_time[t] for t in all_times if t in train_times]
+    test_data_list = [data_by_time[t] for t in all_times if t in test_times]
+    return {'train': train_data_list, 'test': test_data_list}
+
+# ==================== 10. 主流程 ====================
+def preprocess_dlg(dlg_id: str) -> Dict:
+    """
+    对单个DLG执行完整预处理。
+    返回字典包含训练和测试Data列表。
+    """
+    print(f"\n=== 处理 DLG: {dlg_id} ===")
+    # 1. 加载原始数据
+    raw = load_raw_data(dlg_id)
+    nodes_df = raw['nodes'].copy()
+    edges_df = raw['edges'].copy()
+    ts_df = raw['time_series'].copy()
+    
+    # 2. 统一Schema映射
+    nodes_df = map_schema(nodes_df)
+    # 若时间序列也需要映射
+    ts_df = map_schema(ts_df) if len(ts_df) > 0 else ts_df
+    
+    # 3. 过滤缺失率高的节点
+    nodes_df = filter_by_missing(nodes_df, MISSING_THRESHOLD)
+    # 同步过滤时间序列中的节点（若存在）
+    valid_nodes = set(nodes_df['node_id'])
+    if len(ts_df) > 0 and 'node_id' in ts_df.columns:
+        ts_df = ts_df[ts_df['node_id'].isin(valid_nodes)]
+    
+    # 4. 特征变换（对数+标准化）
+    nodes_df = transform_features(nodes_df)
+    if len(ts_df) > 0:
+        ts_df = transform_features(ts_df)
+    
+    # 5. 构建完整时间序列（将静态特征与时间序列合并）
+    if len(ts_df) > 0:
+        # 若ts_df已有时间特征，则直接使用；否则用nodes_df构建一个时间步
+        if 'timestamp' in ts_df.columns:
+            # 已经包含时间戳，直接使用
+            full_ts = ts_df.copy()
+        else:
+            # 使用nodes_df静态特征作为t=0
+            full_ts = nodes_df.copy()
+            full_ts['timestamp'] = 0
+    else:
+        full_ts = nodes_df.copy()
+        full_ts['timestamp'] = 0
+    
+    # 6. 计算边权重
+    edges_df = compute_edge_weights(edges_df)
+    
+    # 7. 时间切分
+    all_timestamps = full_ts['timestamp'].unique()
+    train_times, test_times = temporal_split(all_timestamps, TIME_SPLIT_RATIO)
+    print(f"训练时间步: {len(train_times)}, 测试时间步: {len(test_times)}")
+    
+    # 8. 构建PyG数据（按时间步）
+    pyg_data = build_pyg_data(full_ts, edges_df, train_times, test_times)
+    
+    # 9. 保存处理后的数据（可选）
+    os.makedirs(os.path.join(OUTPUT_ROOT, dlg_id), exist_ok=True)
+    # 保存节点和边（处理后的csv）
+    nodes_df.to_csv(os.path.join(OUTPUT_ROOT, dlg_id, 'nodes_processed.csv'), index=False)
+    edges_df.to_csv(os.path.join(OUTPUT_ROOT, dlg_id, 'edges_processed.csv'), index=False)
+    # 保存时间序列
+    full_ts.to_csv(os.path.join(OUTPUT_ROOT, dlg_id, 'time_series_processed.csv'), index=False)
+    # 保存训练/测试时间列表
+    with open(os.path.join(OUTPUT_ROOT, dlg_id, 'train_times.json'), 'w') as f:
+        json.dump(train_times.tolist(), f)
+    with open(os.path.join(OUTPUT_ROOT, dlg_id, 'test_times.json'), 'w') as f:
+        json.dump(test_times.tolist(), f)
+    
+    return pyg_data
+
+# ==================== 11. 批量处理所有DLG ====================
+class DLGDataset(Dataset):
+    """自定义PyG Dataset，用于加载预处理后的多个DLG"""
+    def __init__(self, root, dlg_ids, split='train'):
+        self.dlg_ids = dlg_ids
+        self.split = split
+        super().__init__(root, None, None)
+    
+    @property
+    def raw_file_names(self):
+        return []  # 假设已预处理
+    
+    @property
+    def processed_file_names(self):
+        # 返回每个DLG的processed文件列表（由预处理生成）
+        return [f"{dlg_id}_{self.split}.pt" for dlg_id in self.dlg_ids]
+    
+    def process(self):
+        # 如果尚未处理，则调用预处理函数
+        for dlg_id in self.dlg_ids:
+            data_dict = preprocess_dlg(dlg_id)
+            # 保存训练和测试数据
+            torch.save(data_dict['train'], os.path.join(self.processed_dir, f"{dlg_id}_train.pt"))
+            torch.save(data_dict['test'], os.path.join(self.processed_dir, f"{dlg_id}_test.pt"))
+    
+    def len(self):
+        return len(self.dlg_ids)
+    
+    def get(self, idx):
+        dlg_id = self.dlg_ids[idx]
+        data_list = torch.load(os.path.join(self.processed_dir, f"{dlg_id}_{self.split}.pt"))
+        return data_list  # 返回一个包含多个时间步Data的列表
