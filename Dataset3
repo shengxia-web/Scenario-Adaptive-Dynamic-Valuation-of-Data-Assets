@@ -1,6 +1,5 @@
 """
 OpenML 数据集预处理全流程
-论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
 参考：OpenML Platform (https://www.openml.org)
 OpenML-Python SDK版本: 0.14.0
 """
