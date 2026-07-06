@@ -1,6 +1,5 @@
 """
 模块1：数据资产图构建 (graph_construction.py)
-论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
 功能：构造时间依赖的有向加权图 G_t = (V, E, X(t), E(t))
 包含节点类型：原始数据集、处理表、分析模型、ETL作业、数据管理员、业务应用
 节点特征：[质量, 访问频率, 业务贡献, 风险等级, 运营成本]
