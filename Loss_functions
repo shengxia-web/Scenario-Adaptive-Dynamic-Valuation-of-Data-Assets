@@ -1,0 +1,371 @@
+"""
+模块8：损失函数 (loss_functions/)
+论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
+功能：实现回归任务的主要损失函数，包括MSE、MAE、RMSE、时序损失和L2正则化。
+      支持联合损失组合，用于模型训练过程中的误差反向传播。
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, List, Union, Tuple
+
+
+class RegressionLosses:
+    """
+    回归任务的基本损失函数集合。
+    包含MSE、MAE、RMSE等评估指标对应的损失计算。
+    """
+
+    @staticmethod
+    def mse_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        均方误差损失 (Mean Squared Error)
+        论文公式: L_MSE = (1/n) * Σ (v_i - v̂_i)^2
+        Args:
+            pred: 预测值张量
+            target: 真实值张量
+        Returns:
+            标量损失
+        """
+        return F.mse_loss(pred, target)
+
+    @staticmethod
+    def mae_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        平均绝对误差损失 (Mean Absolute Error)
+        论文公式: L_MAE = (1/n) * Σ |v_i - v̂_i|
+        Args:
+            pred: 预测值张量
+            target: 真实值张量
+        Returns:
+            标量损失
+        """
+        return F.l1_loss(pred, target)
+
+    @staticmethod
+    def rmse_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        均方根误差损失 (Root Mean Squared Error)
+        RMSE = sqrt(MSE)
+        Args:
+            pred: 预测值张量
+            target: 真实值张量
+        Returns:
+            标量损失
+        """
+        mse = F.mse_loss(pred, target)
+        return torch.sqrt(mse + 1e-8)  # 添加小常数防止数值不稳定
+
+    @staticmethod
+    def huber_loss(pred: torch.Tensor, target: torch.Tensor, delta: float = 1.0) -> torch.Tensor:
+        """
+        Huber损失，结合MSE和MAE的优点，对异常值更鲁棒。
+        Args:
+            pred: 预测值
+            target: 真实值
+            delta: 阈值参数
+        """
+        return F.smooth_l1_loss(pred, target, beta=delta)
+
+    @staticmethod
+    def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        带掩码的MSE损失，仅计算有效位置。
+        Args:
+            pred: 预测值张量
+            target: 真实值张量
+            mask: 布尔掩码张量，True表示计算该位置
+        """
+        loss = (pred - target) ** 2
+        masked_loss = loss * mask.float()
+        return masked_loss.sum() / (mask.float().sum() + 1e-8)
+
+
+class TemporalLosses:
+    """
+    时序相关的损失函数，用于捕捉动态变化和时序一致性。
+    论文公式: L_temporal = Σ_{t=1}^T MSE(v(t), v̂(t))
+    """
+
+    @staticmethod
+    def temporal_mse(pred_seq: torch.Tensor, target_seq: torch.Tensor) -> torch.Tensor:
+        """
+        时序MSE损失，对每个时间步独立计算MSE并求和。
+        Args:
+            pred_seq: [batch_size, seq_len, *] 或 [seq_len, *] 预测序列
+            target_seq: 真实序列，形状与pred_seq相同
+        Returns:
+            标量损失（所有时间步MSE之和）
+        """
+        # 确保序列维度在正确位置（假设最后一维为时间步）
+        if pred_seq.dim() != target_seq.dim():
+            raise ValueError("预测序列和真实序列必须具有相同的维度")
+        # 计算每个时间步的MSE，然后求和
+        # 若时间步在第一维，则先转置
+        if pred_seq.dim() == 2:
+            # [seq_len, N] -> 对每个时间步求MSE
+            mse_per_step = F.mse_loss(pred_seq, target_seq, reduction='none')  # [seq_len, N]
+            # 对每个时间步求和（平均每个时间步内的样本）
+            step_losses = mse_per_step.mean(dim=-1)  # [seq_len]
+            return step_losses.sum()
+        elif pred_seq.dim() == 3:
+            # [batch, seq_len, N] 或 [batch, N, seq_len] 需调整
+            # 假设为 [batch, seq_len, N]
+            mse_per_step = F.mse_loss(pred_seq, target_seq, reduction='none')  # [batch, seq_len, N]
+            step_losses = mse_per_step.mean(dim=[0, 2])  # [seq_len]
+            return step_losses.sum()
+        else:
+            # 通用处理：展平除时间步外的所有维度
+            batch_dims = pred_seq.shape[:-1]
+            seq_len = pred_seq.shape[-1]
+            pred_flat = pred_seq.view(-1, seq_len)
+            target_flat = target_seq.view(-1, seq_len)
+            mse_per_step = F.mse_loss(pred_flat, target_flat, reduction='none')  # [batch_all, seq_len]
+            step_losses = mse_per_step.mean(dim=0)  # [seq_len]
+            return step_losses.sum()
+
+    @staticmethod
+    def temporal_consistency_loss(pred_seq: torch.Tensor, 
+                                  smoothness_weight: float = 1.0) -> torch.Tensor:
+        """
+        时序一致性损失，鼓励预测序列在时间上平滑变化（基于一阶差分惩罚）。
+        可用于正则化，使价值演化更符合实际。
+        Args:
+            pred_seq: [batch, seq_len, *] 预测序列
+            smoothness_weight: 平滑惩罚权重
+        Returns:
+            标量损失
+        """
+        # 计算相邻时间步的差分
+        if pred_seq.dim() == 2:
+            # [seq_len, N]
+            diff = pred_seq[1:] - pred_seq[:-1]  # [seq_len-1, N]
+            penalty = (diff ** 2).mean()
+        elif pred_seq.dim() == 3:
+            # [batch, seq_len, N]
+            diff = pred_seq[:, 1:, :] - pred_seq[:, :-1, :]  # [batch, seq_len-1, N]
+            penalty = (diff ** 2).mean()
+        else:
+            # 展平处理
+            seq_len = pred_seq.shape[-1]
+            pred_flat = pred_seq.view(-1, seq_len)
+            diff = pred_flat[:, 1:] - pred_flat[:, :-1]
+            penalty = (diff ** 2).mean()
+        return smoothness_weight * penalty
+
+    @staticmethod
+    def direction_consistency_loss(pred_seq: torch.Tensor, target_seq: torch.Tensor) -> torch.Tensor:
+        """
+        方向一致性损失，鼓励预测趋势与真实趋势一致（基于符号匹配）。
+        可用于提升方向准确率 (Directional Accuracy)。
+        Args:
+            pred_seq: [batch, seq_len, *] 预测序列
+            target_seq: 真实序列
+        Returns:
+            标量损失（符号不一致的惩罚）
+        """
+        # 计算真实和预测的趋势方向
+        # 使用符号函数比较相邻时间步的变化方向
+        if pred_seq.dim() == 2:
+            pred_diff = pred_seq[1:] - pred_seq[:-1]  # [seq_len-1, N]
+            target_diff = target_seq[1:] - target_seq[:-1]
+        elif pred_seq.dim() == 3:
+            pred_diff = pred_seq[:, 1:, :] - pred_seq[:, :-1, :]  # [batch, seq_len-1, N]
+            target_diff = target_seq[:, 1:, :] - target_seq[:, :-1, :]
+        else:
+            # 展平
+            seq_len = pred_seq.shape[-1]
+            pred_flat = pred_seq.view(-1, seq_len)
+            target_flat = target_seq.view(-1, seq_len)
+            pred_diff = pred_flat[:, 1:] - pred_flat[:, :-1]
+            target_diff = target_flat[:, 1:] - target_flat[:, :-1]
+        # 符号匹配：1 if sign相同 else 0
+        same_sign = (torch.sign(pred_diff) == torch.sign(target_diff)).float()
+        # 损失 = 1 - 匹配率（最小化符号不一致）
+        mismatch_rate = 1 - same_sign.mean()
+        return mismatch_rate
+
+
+class CombinedLosses:
+    """
+    组合损失函数，整合MSE、时序损失和L2正则化。
+    论文公式: L_total = L_MSE + α * L_temporal + β * L_reg
+    """
+
+    def __init__(self,
+                 lambda_temporal: float = 0.1,
+                 lambda_reg: float = 1e-4,
+                 use_mae: bool = False,
+                 temporal_type: str = 'mse',  # 'mse' or 'consistency' or 'both'
+                 reduction: str = 'mean'):
+        """
+        Args:
+            lambda_temporal: 时序损失的权重 α
+            lambda_reg: L2正则化权重 β
+            use_mae: 是否使用MAE替代MSE作为基本损失
+            temporal_type: 时序损失类型，'mse' 为L_temporal，'consistency' 为平滑损失，
+                           'both' 为两者结合
+            reduction: 损失聚合方式，'mean' 或 'sum'
+        """
+        self.lambda_temporal = lambda_temporal
+        self.lambda_reg = lambda_reg
+        self.use_mae = use_mae
+        self.temporal_type = temporal_type
+        self.reduction = reduction
+
+        # 实例化损失函数类
+        self.reg_losses = RegressionLosses()
+        self.temp_losses = TemporalLosses()
+
+    def total_loss(self,
+                   pred: torch.Tensor,
+                   target: torch.Tensor,
+                   model_parameters: Optional[Union[torch.Tensor, list]] = None,
+                   pred_seq: Optional[torch.Tensor] = None,
+                   target_seq: Optional[torch.Tensor] = None,
+                   return_components: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
+        """
+        计算联合损失。
+
+        Args:
+            pred: 当前时间步的预测值 [batch, N, 1] 或 [batch*N, 1]
+            target: 当前时间步的真实值，形状同pred
+            model_parameters: 模型参数（用于L2正则化），可以是模型实例的parameters()列表
+            pred_seq: 多步预测序列 [batch, seq_len, N, 1] 或 [seq_len, N, 1]，用于时序损失
+            target_seq: 多步真实序列，形状同pred_seq
+            return_components: 是否返回各个损失分量
+
+        Returns:
+            若return_components=False: 标量总损失
+            若return_components=True: (总损失, 分量字典)
+        """
+        total_loss = 0.0
+        components = {}
+
+        # 1. 基本回归损失 (MSE or MAE)
+        if self.use_mae:
+            base_loss = self.reg_losses.mae_loss(pred, target)
+        else:
+            base_loss = self.reg_losses.mse_loss(pred, target)
+        total_loss += base_loss
+        components['base_loss'] = base_loss.item()
+
+        # 2. 时序损失（如果提供了序列）
+        if pred_seq is not None and target_seq is not None:
+            if self.temporal_type in ['mse', 'both']:
+                temporal_mse_loss = self.temp_losses.temporal_mse(pred_seq, target_seq)
+                total_loss += self.lambda_temporal * temporal_mse_loss
+                components['temporal_mse'] = temporal_mse_loss.item()
+            if self.temporal_type in ['consistency', 'both']:
+                # 仅对预测序列计算平滑性（可选）
+                # 也可对目标序列？通常只对预测施加
+                consistency_loss = self.temp_losses.temporal_consistency_loss(pred_seq)
+                total_loss += self.lambda_temporal * consistency_loss
+                components['consistency_loss'] = consistency_loss.item()
+        else:
+            # 如果没有序列，则时序损失部分为零
+            components['temporal_loss'] = 0.0
+
+        # 3. L2正则化
+        if model_parameters is not None:
+            if isinstance(model_parameters, torch.Tensor):
+                # 如果是单个张量
+                reg_loss = self.lambda_reg * (model_parameters ** 2).sum()
+            else:
+                # 假设是参数列表（如model.parameters()）
+                reg_loss = 0.0
+                for param in model_parameters:
+                    if param.requires_grad:
+                        reg_loss += (param ** 2).sum()
+                reg_loss = self.lambda_reg * reg_loss
+            total_loss += reg_loss
+            components['reg_loss'] = reg_loss.item()
+        else:
+            components['reg_loss'] = 0.0
+
+        # 根据reduction调整
+        if self.reduction == 'mean':
+            # 对于总损失，我们通常返回均值，但已有部分损失是均值，需要调整
+            # 此处不对总损失进行额外平均，因为各分量已是均值形式
+            pass
+        elif self.reduction == 'sum':
+            # 如果需要求和，需乘以元素数量，这里简单调整
+            num_elements = pred.numel()
+            total_loss = total_loss * num_elements
+
+        if return_components:
+            return total_loss, components
+        else:
+            return total_loss
+
+
+# ==================== 便捷函数 ====================
+def mse_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """MSE损失"""
+    return F.mse_loss(pred, target)
+
+def mae_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """MAE损失"""
+    return F.l1_loss(pred, target)
+
+def rmse_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """RMSE损失"""
+    return torch.sqrt(F.mse_loss(pred, target) + 1e-8)
+
+def temporal_mse_loss(pred_seq: torch.Tensor, target_seq: torch.Tensor) -> torch.Tensor:
+    """时序MSE损失（求和）"""
+    return TemporalLosses.temporal_mse(pred_seq, target_seq)
+
+def l2_regularization(model: torch.nn.Module, lambda_reg: float) -> torch.Tensor:
+    """计算模型L2正则化损失"""
+    reg_loss = 0.0
+    for param in model.parameters():
+        if param.requires_grad:
+            reg_loss += (param ** 2).sum()
+    return lambda_reg * reg_loss
+
+
+if __name__ == "__main__":
+    # 测试基本损失
+    pred = torch.randn(32, 10, 1)
+    target = torch.randn(32, 10, 1)
+
+    reg_losses = RegressionLosses()
+    print("MSE:", reg_losses.mse_loss(pred, target).item())
+    print("MAE:", reg_losses.mae_loss(pred, target).item())
+    print("RMSE:", reg_losses.rmse_loss(pred, target).item())
+
+    # 测试时序损失
+    pred_seq = torch.randn(32, 5, 10, 1)  # [batch, seq_len, N, 1]
+    target_seq = torch.randn(32, 5, 10, 1)
+    temp_losses = TemporalLosses()
+    temp_mse = temp_losses.temporal_mse(pred_seq, target_seq)
+    print("时序MSE:", temp_mse.item())
+    consistency = temp_losses.temporal_consistency_loss(pred_seq)
+    print("一致性损失:", consistency.item())
+
+    # 测试联合损失
+    # 创建一个简单模型用于获取参数
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = torch.nn.Linear(10, 1)
+        def forward(self, x):
+            return self.fc(x)
+    model = DummyModel()
+
+    combined = CombinedLosses(lambda_temporal=0.1, lambda_reg=1e-4)
+    total, comps = combined.total_loss(
+        pred, target,
+        model_parameters=model.parameters(),
+        pred_seq=pred_seq,
+        target_seq=target_seq,
+        return_components=True
+    )
+    print("总损失:", total.item())
+    print("各分量:", comps)
+
+    # 使用便捷函数
+    print("便捷MSE:", mse_loss(pred, target).item())
+    print("便捷L2:", l2_regularization(model, 1e-4).item())
