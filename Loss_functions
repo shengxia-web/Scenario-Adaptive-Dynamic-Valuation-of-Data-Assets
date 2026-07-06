@@ -1,6 +1,5 @@
 """
 模块8：损失函数 (loss_functions/)
-论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
 功能：实现回归任务的主要损失函数，包括MSE、MAE、RMSE、时序损失和L2正则化。
       支持联合损失组合，用于模型训练过程中的误差反向传播。
 """
