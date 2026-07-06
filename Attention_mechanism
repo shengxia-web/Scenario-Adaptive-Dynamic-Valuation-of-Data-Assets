@@ -1,0 +1,297 @@
+"""
+模块5：多头注意力机制 (attention_mechanism.py)
+论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
+功能：实现多头注意力用于差异化值传播，支持8头并行注意力。
+关键公式：Attention(Q,K,V) = softmax(QK^T / √d_k) V
+用途：可用于消息聚合、特征重加权、场景适配中的相关性建模。
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple, Union
+
+
+class MultiHeadAttention(nn.Module):
+    """
+    多头注意力模块，支持缩放点积注意力、掩码、多头拼接和权重获取。
+    配置：可根据需要设置头数（默认8），输入/输出维度等。
+    """
+
+    def __init__(self,
+                 embed_dim: int,
+                 num_heads: int = 8,
+                 dropout: float = 0.0,
+                 bias: bool = True,
+                 add_bias_kv: bool = False,
+                 add_zero_attn: bool = False,
+                 kdim: Optional[int] = None,
+                 vdim: Optional[int] = None,
+                 batch_first: bool = True):
+        """
+        Args:
+            embed_dim: 输入特征的维度（Q、K、V的投影维度）
+            num_heads: 注意力头数（论文中为8）
+            dropout: 注意力系数的dropout率
+            bias: 是否添加偏置
+            add_bias_kv: 是否在键/值中添加偏置（默认False）
+            add_zero_attn: 是否添加零注意力（用于空掩码）
+            kdim: 键的维度（若与embed_dim不同）
+            vdim: 值的维度（若与embed_dim不同）
+            batch_first: 是否批量维度在第一维（默认True）
+        """
+        super(MultiHeadAttention, self).__init__()
+        self.embed_dim = embed_dim
+        self.kdim = kdim if kdim is not None else embed_dim
+        self.vdim = vdim if vdim is not None else embed_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.batch_first = batch_first
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == embed_dim, "embed_dim必须能被num_heads整除"
+
+        # 线性投影层：Q, K, V
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj = nn.Linear(self.kdim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(self.vdim, embed_dim, bias=bias)
+
+        # 输出投影
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        # dropout层
+        self.dropout_layer = nn.Dropout(dropout)
+
+        # 存储最近一次的注意力权重（用于可解释性）
+        self._attn_weights = None
+
+    def _reshape_for_heads(self, x: torch.Tensor, batch_size: int, seq_len: int) -> torch.Tensor:
+        """
+        将 [batch, seq_len, embed_dim] 重塑为 [batch * num_heads, seq_len, head_dim]
+        以便并行计算多头注意力。
+        """
+        x = x.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        # 交换维度：batch, seq_len, heads, head_dim -> batch, heads, seq_len, head_dim
+        x = x.transpose(1, 2)
+        # 合并batch和heads：batch * heads, seq_len, head_dim
+        return x.reshape(batch_size * self.num_heads, seq_len, self.head_dim)
+
+    def _combine_heads(self, x: torch.Tensor, batch_size: int, seq_len: int) -> torch.Tensor:
+        """
+        将多头输出合并回原始形状。
+        x: [batch * num_heads, seq_len, head_dim]
+        返回: [batch, seq_len, embed_dim]
+        """
+        x = x.view(batch_size, self.num_heads, seq_len, self.head_dim)
+        # 交换维度：batch, heads, seq_len, head_dim -> batch, seq_len, heads, head_dim
+        x = x.transpose(1, 2)
+        # 合并最后两维
+        return x.contiguous().view(batch_size, seq_len, self.embed_dim)
+
+    def compute_attention_scores(self,
+                                 query: torch.Tensor,
+                                 key: torch.Tensor,
+                                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        计算缩放点积注意力分数（未应用softmax）。
+        Args:
+            query: [batch, seq_len_q, embed_dim] 或 [batch * num_heads, seq_len_q, head_dim]
+            key:   [batch, seq_len_k, embed_dim] 或 [batch * num_heads, seq_len_k, head_dim]
+            mask:  [batch, seq_len_q, seq_len_k] 或 [batch * num_heads, seq_len_q, seq_len_k]
+                   (可选) 用于屏蔽特定位置，True表示掩蔽（不计算）。
+
+        Returns:
+            scores: [batch * num_heads, seq_len_q, seq_len_k] 未归一化的注意力分数
+        """
+        # 检查输入维度，若未分割，则分割
+        if query.dim() == 3 and query.size(-1) == self.embed_dim:
+            # 需要分割多头
+            batch_size = query.size(0)
+            seq_len_q = query.size(1)
+            seq_len_k = key.size(1)
+            # 线性投影并分割
+            q = self.q_proj(query)  # [batch, seq_len_q, embed_dim]
+            k = self.k_proj(key)    # [batch, seq_len_k, embed_dim]
+            # 重塑为多头
+            q = self._reshape_for_heads(q, batch_size, seq_len_q)  # [batch*heads, seq_len_q, head_dim]
+            k = self._reshape_for_heads(k, batch_size, seq_len_k)  # [batch*heads, seq_len_k, head_dim]
+        else:
+            # 假设已经分割好
+            q = query
+            k = key
+            batch_size = q.size(0) // self.num_heads
+            seq_len_q = q.size(1)
+            seq_len_k = k.size(1)
+
+        # 计算缩放点积: Q * K^T / sqrt(head_dim)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        # scores: [batch*heads, seq_len_q, seq_len_k]
+
+        # 应用掩码（如果有）
+        if mask is not None:
+            # mask 形状可能与 scores 不同，需扩展
+            if mask.dim() == 3:
+                # 可能为 [batch, seq_len_q, seq_len_k]
+                # 需要复制到每个头
+                if mask.size(0) == batch_size:
+                    mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1)
+                    mask = mask.view(batch_size * self.num_heads, seq_len_q, seq_len_k)
+            # 将掩码位置设为负无穷
+            scores = scores.masked_fill(mask, float('-inf'))
+
+        return scores
+
+    def apply_attention_mask(self,
+                             scores: torch.Tensor,
+                             mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        对注意力分数应用掩码，并返回softmax后的注意力权重。
+        该方法封装了掩码应用和softmax归一化。
+        """
+        if mask is not None:
+            # 假设scores已经考虑了批量维度，mask应与之匹配
+            scores = scores.masked_fill(mask, float('-inf'))
+        attn_weights = F.softmax(scores, dim=-1)  # [batch*heads, seq_len_q, seq_len_k]
+        attn_weights = self.dropout_layer(attn_weights)
+        return attn_weights
+
+    def combine_head_outputs(self,
+                             attn_output: torch.Tensor,
+                             batch_size: int,
+                             seq_len_q: int) -> torch.Tensor:
+        """
+        将多头注意力输出合并回原始特征维度。
+        attn_output: [batch * num_heads, seq_len_q, head_dim] 或 [batch, seq_len_q, num_heads, head_dim]
+        """
+        if attn_output.dim() == 3 and attn_output.size(0) % self.num_heads == 0:
+            # 已分割，需要合并
+            return self._combine_heads(attn_output, batch_size, seq_len_q)
+        elif attn_output.dim() == 4:
+            # [batch, seq_len_q, num_heads, head_dim] -> 直接合并
+            return attn_output.contiguous().view(batch_size, seq_len_q, self.embed_dim)
+        else:
+            raise ValueError(f"Unexpected attn_output shape: {attn_output.shape}")
+
+    def forward(self,
+                query: torch.Tensor,
+                key: torch.Tensor,
+                value: torch.Tensor,
+                mask: Optional[torch.Tensor] = None,
+                return_attention_weights: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        前向传播。
+
+        Args:
+            query: [batch, seq_len_q, embed_dim] (如果batch_first=True)
+            key:   [batch, seq_len_k, embed_dim]
+            value: [batch, seq_len_v, embed_dim] (通常seq_len_v=seq_len_k)
+            mask:  [batch, seq_len_q, seq_len_k] 可选掩码，True表示掩蔽
+            return_attention_weights: 是否返回注意力权重
+
+        Returns:
+            output: [batch, seq_len_q, embed_dim] 注意力输出
+            attention_weights: [batch, seq_len_q, seq_len_k] (如果return_attention_weights=True)
+        """
+        if not self.batch_first:
+            # 转换为batch_first
+            query = query.transpose(0, 1)
+            key = key.transpose(0, 1)
+            value = value.transpose(0, 1)
+
+        batch_size, seq_len_q, _ = query.size()
+        seq_len_k = key.size(1)
+        seq_len_v = value.size(1)
+        assert seq_len_k == seq_len_v, "key和value的长度必须一致"
+
+        # 线性投影
+        q = self.q_proj(query)  # [batch, seq_len_q, embed_dim]
+        k = self.k_proj(key)    # [batch, seq_len_k, embed_dim]
+        v = self.v_proj(value)  # [batch, seq_len_v, embed_dim]
+
+        # 分割多头
+        q = self._reshape_for_heads(q, batch_size, seq_len_q)  # [batch*heads, seq_len_q, head_dim]
+        k = self._reshape_for_heads(k, batch_size, seq_len_k)  # [batch*heads, seq_len_k, head_dim]
+        v = self._reshape_for_heads(v, batch_size, seq_len_v)  # [batch*heads, seq_len_v, head_dim]
+
+        # 计算缩放点积注意力分数
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        # scores: [batch*heads, seq_len_q, seq_len_k]
+
+        # 应用掩码
+        if mask is not None:
+            # 掩码扩展适配多头
+            if mask.dim() == 3:
+                # 假设mask [batch, seq_len_q, seq_len_k]
+                mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1)
+                mask = mask.view(batch_size * self.num_heads, seq_len_q, seq_len_k)
+            scores = scores.masked_fill(mask, float('-inf'))
+
+        # 应用softmax
+        attn_weights = F.softmax(scores, dim=-1)  # [batch*heads, seq_len_q, seq_len_k]
+        attn_weights = self.dropout_layer(attn_weights)
+
+        # 存储注意力权重（用于可解释性）
+        self._attn_weights = attn_weights
+
+        # 加权求和
+        attn_output = torch.matmul(attn_weights, v)  # [batch*heads, seq_len_q, head_dim]
+
+        # 合并多头
+        output = self._combine_heads(attn_output, batch_size, seq_len_q)  # [batch, seq_len_q, embed_dim]
+
+        # 输出投影
+        output = self.out_proj(output)
+
+        if not self.batch_first:
+            output = output.transpose(0, 1)
+
+        if return_attention_weights:
+            # 将注意力权重恢复为 [batch, seq_len_q, seq_len_k] (平均多头)
+            # 也可以返回多头权重，这里我们返回平均权重（多头平均）
+            avg_weights = attn_weights.view(batch_size, self.num_heads, seq_len_q, seq_len_k).mean(dim=1)
+            return output, avg_weights
+        else:
+            return output
+
+    def get_attention_weights(self) -> Optional[torch.Tensor]:
+        """
+        返回最近一次前向传播中的注意力权重（未平均的多头权重）。
+        形状: [batch * num_heads, seq_len_q, seq_len_k]
+        """
+        return self._attn_weights
+
+
+# ==================== 使用示例 ====================
+if __name__ == "__main__":
+    # 参数配置（论文：8头注意力）
+    embed_dim = 128
+    num_heads = 8
+    batch_size = 32
+    seq_len_q = 10
+    seq_len_k = 10
+
+    # 创建多头注意力模块
+    mha = MultiHeadAttention(
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        dropout=0.1,
+        batch_first=True
+    )
+
+    # 生成输入数据（实际应用中从特征提取）
+    query = torch.randn(batch_size, seq_len_q, embed_dim)
+    key = torch.randn(batch_size, seq_len_k, embed_dim)
+    value = torch.randn(batch_size, seq_len_k, embed_dim)
+
+    # 前向传播（不返回权重）
+    output = mha(query, key, value)
+    print(f"输出形状: {output.shape}")  # [32, 10, 128]
+
+    # 返回注意力权重
+    output, attn_weights = mha(query, key, value, return_attention_weights=True)
+    print(f"注意力权重形状: {attn_weights.shape}")  # [32, 10, 10]
+
+    # 获取存储的权重（未平均）
+    raw_weights = mha.get_attention_weights()
+    print(f"原始多头权重形状: {raw_weights.shape}")  # [32*8, 10, 10]
+
+    print("\n模块测试完成。")
