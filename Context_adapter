@@ -1,0 +1,325 @@
+"""
+模块4：场景自适应器 (context_adapter.py)
+论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
+功能：
+1. 编码业务场景和外部环境信息为上下文嵌入向量 z^{(c)}
+2. 根据场景自适应地重加权节点特征（实现场景感知的特征重要性调整）
+3. 支持消融实验A1 (w/o Context)：移除场景编码后对比性能变化
+关键公式：z^{(c)} 作为公式(6)和(8)中的上下文向量，影响消息传递和状态更新
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, List, Optional, Tuple, Union
+import numpy as np
+
+
+class ContextAdapter(nn.Module):
+    """
+    场景自适应器：编码业务场景和外部环境，生成上下文嵌入，并对特征进行场景感知重加权。
+    支持消融实验中的上下文移除（use_context=False）。
+    """
+
+    def __init__(self,
+                 scenario_feature_dim: int = 16,
+                 env_feature_dim: int = 8,
+                 context_embed_dim: int = 32,
+                 feature_dim: int = 5,
+                 use_context: bool = True,
+                 scenario_embed_mlp_layers: List[int] = None,
+                 env_embed_mlp_layers: List[int] = None,
+                 use_attention_weighting: bool = True,
+                 dropout: float = 0.1):
+        """
+        Args:
+            scenario_feature_dim: 业务场景特征向量的维度（如场景类型的one-hot或连续特征）
+            env_feature_dim: 外部环境特征向量的维度（如市场指数、政策强度等）
+            context_embed_dim: 上下文嵌入维度（即z^{(c)}的维度）
+            feature_dim: 节点特征维度（论文中为5）
+            use_context: 是否启用上下文（为False时相当于消融实验A1）
+            scenario_embed_mlp_layers: 场景编码MLP的隐藏层维度列表，默认为[64, 32]
+            env_embed_mlp_layers: 环境编码MLP的隐藏层维度列表，默认为[32, 16]
+            use_attention_weighting: 是否使用注意力机制进行特征重加权（否则用简单缩放）
+            dropout: dropout率
+        """
+        super(ContextAdapter, self).__init__()
+
+        self.use_context = use_context
+        self.feature_dim = feature_dim
+        self.context_embed_dim = context_embed_dim
+        self.use_attention_weighting = use_attention_weighting
+
+        # 设置默认MLP层
+        if scenario_embed_mlp_layers is None:
+            scenario_embed_mlp_layers = [64, 32]
+        if env_embed_mlp_layers is None:
+            env_embed_mlp_layers = [32, 16]
+
+        # 场景编码MLP
+        scenario_layers = []
+        input_dim = scenario_feature_dim
+        for hidden_dim in scenario_embed_mlp_layers:
+            scenario_layers.append(nn.Linear(input_dim, hidden_dim))
+            scenario_layers.append(nn.LeakyReLU(0.2))
+            scenario_layers.append(nn.Dropout(dropout))
+            input_dim = hidden_dim
+        # 最终映射到上下文嵌入空间
+        scenario_layers.append(nn.Linear(input_dim, context_embed_dim))
+        self.scenario_encoder = nn.Sequential(*scenario_layers)
+
+        # 环境编码MLP
+        env_layers = []
+        input_dim = env_feature_dim
+        for hidden_dim in env_embed_mlp_layers:
+            env_layers.append(nn.Linear(input_dim, hidden_dim))
+            env_layers.append(nn.LeakyReLU(0.2))
+            env_layers.append(nn.Dropout(dropout))
+            input_dim = hidden_dim
+        env_layers.append(nn.Linear(input_dim, context_embed_dim))
+        self.env_encoder = nn.Sequential(*env_layers)
+
+        # 融合场景和环境嵌入，生成最终上下文向量 z^{(c)}
+        # 使用门控融合或简单相加
+        self.context_gate = nn.Sequential(
+            nn.Linear(context_embed_dim * 2, context_embed_dim),
+            nn.Sigmoid()
+        )
+        self.context_proj = nn.Linear(context_embed_dim, context_embed_dim)
+
+        # 特征重加权模块：根据上下文向量对每个特征维度生成重要性权重
+        if self.use_attention_weighting:
+            # 使用注意力机制：计算上下文和特征之间的相关性
+            self.attention = nn.MultiheadAttention(
+                embed_dim=feature_dim,
+                num_heads=1,
+                batch_first=True,
+                dropout=dropout
+            )
+            # 注意力中的query: 上下文嵌入的投影
+            self.query_proj = nn.Linear(context_embed_dim, feature_dim)
+            # key/value: 节点特征本身
+        else:
+            # 简单缩放：上下文通过线性层预测缩放因子和偏置
+            self.scale_net = nn.Sequential(
+                nn.Linear(context_embed_dim, feature_dim),
+                nn.Tanh()  # 缩放因子在[-1,1]之间
+            )
+            self.shift_net = nn.Sequential(
+                nn.Linear(context_embed_dim, feature_dim),
+                nn.Tanh()
+            )
+
+        # 可选：存储上下文影响系数
+        self._context_influence = None
+
+        # 是否启用上下文的标志（用于消融实验）
+        self.use_context = use_context
+
+    def encode_business_scenario(self,
+                                 scenario_params: torch.Tensor) -> torch.Tensor:
+        """
+        编码业务场景参数为场景嵌入向量。
+
+        Args:
+            scenario_params: [batch_size, scenario_feature_dim] 或 [num_nodes, scenario_feature_dim]
+                             包含场景类型、促销活动、季节性等特征。
+                             例如：双十一促销标识、行业类别、数据用途类型等。
+
+        Returns:
+            scenario_emb: [batch_size, context_embed_dim] 场景嵌入
+        """
+        if not self.use_context:
+            # 若禁用上下文，返回零向量（等同于无场景影响）
+            return torch.zeros(scenario_params.size(0), self.context_embed_dim,
+                               device=scenario_params.device)
+        return self.scenario_encoder(scenario_params)
+
+    def encode_external_environment(self,
+                                    env_params: torch.Tensor) -> torch.Tensor:
+        """
+        编码外部环境参数为环境嵌入向量。
+
+        Args:
+            env_params: [batch_size, env_feature_dim] 包含政策强度、市场波动、合规要求等。
+
+        Returns:
+            env_emb: [batch_size, context_embed_dim] 环境嵌入
+        """
+        if not self.use_context:
+            return torch.zeros(env_params.size(0), self.context_embed_dim,
+                               device=env_params.device)
+        return self.env_encoder(env_params)
+
+    def get_context_embedding(self,
+                              scenario_params: Optional[torch.Tensor] = None,
+                              env_params: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        综合场景和环境信息，生成最终上下文向量 z^{(c)}。
+        若任一参数为None，则对应嵌入置为零向量。
+
+        Returns:
+            context_emb: [batch_size, context_embed_dim]
+        """
+        if not self.use_context:
+            # 消融实验：返回全零上下文
+            batch_size = 1
+            if scenario_params is not None:
+                batch_size = scenario_params.size(0)
+            elif env_params is not None:
+                batch_size = env_params.size(0)
+            return torch.zeros(batch_size, self.context_embed_dim,
+                               device=next(self.parameters()).device)
+
+        # 编码场景
+        if scenario_params is not None:
+            scenario_emb = self.encode_business_scenario(scenario_params)
+        else:
+            # 若无场景参数，使用可学习的默认场景嵌入或零向量
+            # 这里我们使用零向量（也可用可学习参数）
+            if not hasattr(self, '_default_scenario'):
+                self.register_parameter('_default_scenario',
+                                        nn.Parameter(torch.zeros(1, self.context_embed_dim)))
+            scenario_emb = self._default_scenario.expand(scenario_params.size(0), -1) \
+                if scenario_params is not None else self._default_scenario
+
+        # 编码环境
+        if env_params is not None:
+            env_emb = self.encode_external_environment(env_params)
+        else:
+            if not hasattr(self, '_default_env'):
+                self.register_parameter('_default_env',
+                                        nn.Parameter(torch.zeros(1, self.context_embed_dim)))
+            env_emb = self._default_env.expand(env_params.size(0), -1) \
+                if env_params is not None else self._default_env
+
+        # 确保批量维度一致
+        if scenario_params is not None and env_params is not None:
+            assert scenario_params.size(0) == env_params.size(0), "批量大小不一致"
+
+        # 门控融合
+        combined = torch.cat([scenario_emb, env_emb], dim=-1)  # [batch, 2*C]
+        gate = self.context_gate(combined)  # [batch, C]
+        context_emb = gate * scenario_emb + (1 - gate) * env_emb
+        context_emb = self.context_proj(context_emb)
+
+        # 存储以备后续分析
+        self._context_influence = context_emb.detach()
+
+        return context_emb
+
+    def adaptive_reweighting(self,
+                             features: torch.Tensor,
+                             scenario_params: Optional[torch.Tensor] = None,
+                             env_params: Optional[torch.Tensor] = None,
+                             return_weights: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        根据上下文对节点特征进行场景自适应重加权。
+
+        Args:
+            features: [batch_size, feature_dim] 节点特征（如 [quality, access_freq, business_contrib, risk, cost]）
+            scenario_params: [batch_size, scenario_feature_dim] 场景参数
+            env_params: [batch_size, env_feature_dim] 环境参数
+            return_weights: 是否返回权重系数
+
+        Returns:
+            if return_weights:
+                (adjusted_features, importance_weights)
+            else:
+                adjusted_features: [batch_size, feature_dim]
+        """
+        if not self.use_context:
+            # 消融实验：不进行任何重加权，直接返回原始特征
+            if return_weights:
+                return features, torch.ones_like(features)
+            return features
+
+        # 获取上下文嵌入
+        context_emb = self.get_context_embedding(scenario_params, env_params)
+        # context_emb: [batch, context_embed_dim]
+
+        if self.use_attention_weighting:
+            # 使用多头注意力：上下文作为query，特征作为key和value
+            # 将特征扩展为序列长度=1（每个样本单独）
+            # features: [batch, feature_dim] -> [batch, 1, feature_dim]
+            features_seq = features.unsqueeze(1)
+            # 上下文投影为query: [batch, 1, feature_dim]
+            query = self.query_proj(context_emb).unsqueeze(1)
+            # 注意力
+            attn_output, attn_weights = self.attention(query, features_seq, features_seq)
+            # attn_output: [batch, 1, feature_dim]
+            adjusted = attn_output.squeeze(1)  # [batch, feature_dim]
+            # 注意力权重作为重要性权重（取平均）
+            importance_weights = attn_weights.squeeze(1)  # [batch, 1, feature_dim] -> [batch, feature_dim]
+            # 因为注意力输出是加权和，但特征已调整，我们使用残差连接
+            adjusted = features + 0.1 * adjusted  # 加入小的调整，保留原始特征
+        else:
+            # 使用缩放和移位
+            scale = self.scale_net(context_emb)  # [batch, feature_dim]
+            shift = self.shift_net(context_emb)  # [batch, feature_dim]
+            # 应用仿射变换: adjusted = scale * features + shift
+            adjusted = scale * features + shift
+            importance_weights = scale.abs()  # 缩放绝对值作为影响程度
+
+        # 确保不改变特征范围（可选）
+        # 这里我们返回调整后的特征
+
+        if return_weights:
+            return adjusted, importance_weights
+        else:
+            return adjusted
+
+    def compute_context_influence(self) -> Optional[torch.Tensor]:
+        """
+        计算上下文对当前批次特征的影响程度（可解释性）。
+        返回最近一次上下文嵌入。
+        """
+        return self._context_influence
+
+    def set_use_context(self, use_context: bool):
+        """
+        设置是否启用上下文（用于消融实验A1）。
+        """
+        self.use_context = use_context
+
+if __name__ == "__main__":
+    # 参数配置
+    batch_size = 32
+    scenario_feature_dim = 16  # 场景类型、促销标识、行业代码等
+    env_feature_dim = 8        # 政策指数、市场波动率、合规压力等
+    feature_dim = 5            # [quality, access_freq, business_contrib, risk, cost]
+    context_embed_dim = 32
+
+    # 初始化上下文适配器（启用上下文）
+    adapter = ContextAdapter(
+        scenario_feature_dim=scenario_feature_dim,
+        env_feature_dim=env_feature_dim,
+        context_embed_dim=context_embed_dim,
+        feature_dim=feature_dim,
+        use_context=True,
+        use_attention_weighting=True
+    )
+
+    # 输入（从真实数据加载）
+    scenario_params = torch.randn(batch_size, scenario_feature_dim)
+    env_params = torch.randn(batch_size, env_feature_dim)
+    features = torch.randn(batch_size, feature_dim)
+
+    # 1. 获取上下文嵌入
+    context_emb = adapter.get_context_embedding(scenario_params, env_params)
+    print(f"上下文嵌入形状: {context_emb.shape}")  # [32, 32]
+
+    # 2. 自适应重加权
+    adjusted_features, weights = adapter.adaptive_reweighting(
+        features, scenario_params, env_params, return_weights=True
+    )
+    print(f"调整后特征形状: {adjusted_features.shape}")  # [32, 5]
+    print(f"特征权重形状: {weights.shape}")  # [32, 5]（注意力模式下为注意力权重）
+
+    # 3. 消融实验A1：禁用上下文
+    adapter.set_use_context(False)
+    adjusted_no_context = adapter.adaptive_reweighting(features)
+    # 此时应返回原始特征（未调整）
+    print(f"禁用上下文时特征是否相同: {torch.allclose(adjusted_no_context, features)}")  # True
+
+    print("\n消融实验对比 (w/o Context): 根据论文，移除场景编码后MSE从0.123增至0.141，R^2从0.832降至0.801")
