@@ -1,6 +1,5 @@
 """
 模块3：GRU解码器 (gru_decoder.py)
-论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
 功能：实现单层GRU用于时序建模，将GAT编码器输出的节点嵌入序列作为输入，
      更新节点时序状态，支持未来状态预测。
 配置：64维隐层，1层，LeakyReLU激活。
