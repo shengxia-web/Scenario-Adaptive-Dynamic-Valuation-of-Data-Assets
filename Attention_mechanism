@@ -1,6 +1,5 @@
 """
 模块5：多头注意力机制 (attention_mechanism.py)
-论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
 功能：实现多头注意力用于差异化值传播，支持8头并行注意力。
 关键公式：Attention(Q,K,V) = softmax(QK^T / √d_k) V
 用途：可用于消息聚合、特征重加权、场景适配中的相关性建模。
