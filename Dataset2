@@ -1,6 +1,5 @@
 """
 OpenDataVal 数据集预处理全流程
-论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
 参考：OpenDataVal (NeurIPS 2023 Datasets and Benchmarks Track)
 """
 
