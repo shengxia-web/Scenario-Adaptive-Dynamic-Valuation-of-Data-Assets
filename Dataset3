@@ -1,0 +1,651 @@
+"""
+OpenML 数据集预处理全流程
+论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
+参考：OpenML Platform (https://www.openml.org)
+OpenML-Python SDK版本: 0.14.0
+"""
+
+import os
+import json
+import time
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Tuple, Optional, Union
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==================== 1. OpenML 依赖导入 ====================
+# 安装: pip install openml
+# 论文测试于 OpenML Python SDK 0.14.0
+try:
+    import openml
+    from openml.datasets import get_dataset, list_datasets
+    from openml.exceptions import OpenMLServerException
+except ImportError as e:
+    print(f"请先安装 OpenML: pip install openml")
+    print(f"导入错误: {e}")
+    raise
+
+# ==================== 2. 配置参数 ====================
+OUTPUT_ROOT = "./processed/OpenML"
+RANDOM_SEED = 42
+TEST_SIZE = 0.2
+VAL_SIZE = 0.1
+MAX_DATASETS = 5041  # 论文中提及的数据集总数
+BATCH_SIZE = 100     # 批量请求大小，避免API超限
+CACHE_DIR = "./openml_cache"
+MISSING_THRESHOLD = 0.5
+
+np.random.seed(RANDOM_SEED)
+
+# 配置OpenML缓存目录
+openml.config.set_cache_directory(CACHE_DIR)
+
+# ==================== 3. OpenML 数据集列表获取 ====================
+def fetch_openml_dataset_list(
+    max_datasets: int = MAX_DATASETS,
+    output_format: str = "dataframe",
+    batch_size: int = BATCH_SIZE
+) -> pd.DataFrame:
+    """
+    获取OpenML平台上的数据集列表。
+    返回包含所有数据集基本信息的DataFrame，包括数据集ID、名称、版本、格式等。
+    
+    OpenML API参考: https://openml.github.io/openml-python/main/api.html#list-datasets
+    """
+    print(f"正在获取OpenML数据集列表（最多 {max_datasets} 个）...")
+    
+    all_datasets = []
+    offset = 0
+    
+    while len(all_datasets) < max_datasets:
+        try:
+            # 分批次获取数据集列表，避免API超时
+            batch = list_datasets(
+                offset=offset,
+                size=batch_size,
+                output_format="dataframe"
+            )
+            if batch.empty:
+                break
+            all_datasets.append(batch)
+            offset += batch_size
+            print(f"已获取 {len(batch)} 个数据集，累计 {len(pd.concat(all_datasets, ignore_index=True))} 个")
+            # 避免请求过快
+            time.sleep(0.5)
+        except OpenMLServerException as e:
+            print(f"API请求失败: {e}")
+            break
+        except Exception as e:
+            print(f"未知错误: {e}")
+            break
+    
+    if not all_datasets:
+        raise RuntimeError("未能获取任何数据集，请检查网络连接和OpenML服务状态")
+    
+    df = pd.concat(all_datasets, ignore_index=True)
+    
+    # 按数据集质量排序，优先获取高质量数据集
+    if 'quality' in df.columns:
+        df = df.sort_values('quality', ascending=False)
+    
+    # 限制数量
+    if len(df) > max_datasets:
+        df = df.head(max_datasets)
+    
+    print(f"成功获取 {len(df)} 个数据集")
+    print(f"数据集列: {df.columns.tolist()}")
+    
+    return df
+
+# ==================== 4. 数据集质量指标获取 ====================
+def fetch_dataset_qualities(dataset_id: int) -> Dict[str, Union[float, int, str]]:
+    """
+    获取单个数据集的101个质量指标。
+    
+    OpenML自动计算的质量指标包括:
+    - 基本统计: 样本数、特征数、类别数、缺失值数量等
+    - 数据质量: 完整性、准确性、及时性等维度
+    - 高级统计: 特征间的互信息、简单模型的基准性能等
+    
+    参考: https://docs.openml.org/concepts/data/#automated-analysis[reference:1]
+    """
+    try:
+        dataset = get_dataset(dataset_id, download_data=False)
+        
+        # 获取质量指标
+        qualities = {}
+        if hasattr(dataset, 'qualities') and dataset.qualities:
+            for key, value in dataset.qualities.items():
+                # 尝试转换为数值类型
+                try:
+                    qualities[key] = float(value) if value is not None else np.nan
+                except (ValueError, TypeError):
+                    qualities[key] = str(value) if value is not None else np.nan
+        
+        # 获取基本信息
+        qualities['dataset_id'] = dataset_id
+        qualities['dataset_name'] = dataset.name if hasattr(dataset, 'name') else f"dataset_{dataset_id}"
+        qualities['version'] = dataset.version if hasattr(dataset, 'version') else 1
+        qualities['format'] = dataset.format if hasattr(dataset, 'format') else 'unknown'
+        
+        # 获取特征数量（如果可用）
+        if hasattr(dataset, 'features'):
+            qualities['number_of_features'] = len(dataset.features)
+        
+        # 获取默认目标属性
+        if hasattr(dataset, 'default_target_attribute'):
+            qualities['default_target'] = dataset.default_target_attribute
+        
+        return qualities
+        
+    except OpenMLServerException as e:
+        print(f"获取数据集 {dataset_id} 质量指标失败: {e}")
+        return {'dataset_id': dataset_id, 'error': str(e)}
+    except Exception as e:
+        print(f"获取数据集 {dataset_id} 时发生未知错误: {e}")
+        return {'dataset_id': dataset_id, 'error': str(e)}
+
+def fetch_all_dataset_qualities(
+    dataset_ids: List[int],
+    output_file: Optional[str] = None
+) -> pd.DataFrame:
+    """
+    批量获取多个数据集的质量指标。
+    """
+    print(f"正在获取 {len(dataset_ids)} 个数据集的质量指标...")
+    
+    all_qualities = []
+    failed_ids = []
+    
+    for i, did in enumerate(dataset_ids):
+        try:
+            qualities = fetch_dataset_qualities(did)
+            if 'error' not in qualities:
+                all_qualities.append(qualities)
+            else:
+                failed_ids.append(did)
+            
+            # 进度显示
+            if (i + 1) % 50 == 0:
+                print(f"进度: {i + 1}/{len(dataset_ids)}")
+            
+            # 避免请求过于频繁
+            time.sleep(0.2)
+            
+        except Exception as e:
+            print(f"处理数据集 {did} 时出错: {e}")
+            failed_ids.append(did)
+            continue
+    
+    df = pd.DataFrame(all_qualities)
+    
+    # 处理数值列：将字符串转换为数值
+    for col in df.columns:
+        if col not in ['dataset_id', 'dataset_name', 'version', 'format', 'default_target', 'error']:
+            try:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            except:
+                pass
+    
+    print(f"成功获取 {len(df)} 个数据集的质量指标")
+    if failed_ids:
+        print(f"失败的数据集ID: {failed_ids}")
+    
+    # 保存到文件
+    if output_file:
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        df.to_csv(output_file, index=False)
+        print(f"质量指标已保存至: {output_file}")
+    
+    return df
+
+# ==================== 5. 数据集实际数据加载 ====================
+def load_dataset_data(
+    dataset_id: int,
+    target_column: Optional[str] = None,
+    dataset_format: str = "array"
+) -> Tuple[np.ndarray, np.ndarray, List[str], List[bool]]:
+    """
+    加载OpenML数据集的完整数据。
+    
+    返回:
+        X: 特征矩阵 (n_samples, n_features)
+        y: 目标向量 (n_samples,)
+        attribute_names: 特征名称列表
+        categorical_indicator: 分类特征指示器
+    """
+    try:
+        dataset = get_dataset(dataset_id, download_data=True)
+        
+        # 如果未指定目标列，使用数据集的默认目标
+        if target_column is None:
+            target_column = dataset.default_target_attribute
+        
+        # 获取数据
+        X, y, categorical_indicator, attribute_names = dataset.get_data(
+            target=target_column,
+            dataset_format=dataset_format
+        )
+        
+        return X, y, attribute_names, categorical_indicator
+        
+    except Exception as e:
+        print(f"加载数据集 {dataset_id} 数据失败: {e}")
+        return None, None, None, None
+
+# ==================== 6. 特征工程与预处理 ====================
+def preprocess_features(
+    X: np.ndarray,
+    y: np.ndarray,
+    categorical_indicator: Optional[List[bool]] = None,
+    attribute_names: Optional[List[str]] = None,
+    scaler: Optional[StandardScaler] = None,
+    label_encoder: Optional[LabelEncoder] = None
+) -> Dict:
+    """
+    特征预处理:
+    1. 处理分类特征（如果提供了指示器）
+    2. 标签编码
+    3. 缺失值处理
+    4. Z-score标准化
+    """
+    X_processed = X.copy() if X is not None else None
+    y_processed = y.copy() if y is not None else None
+    
+    # 处理特征
+    if X_processed is not None:
+        # 处理分类特征：如果提供了指示器，将分类特征转换为数值
+        if categorical_indicator is not None and len(categorical_indicator) == X_processed.shape[1]:
+            for idx, is_cat in enumerate(categorical_indicator):
+                if is_cat:
+                    # 使用LabelEncoder处理分类特征
+                    le = LabelEncoder()
+                    # 处理缺失值
+                    col_data = X_processed[:, idx]
+                    if np.any(pd.isnull(col_data)):
+                        # 用众数填充
+                        mode_val = pd.Series(col_data).mode()[0] if len(pd.Series(col_data).mode()) > 0 else 'unknown'
+                        col_data[pd.isnull(col_data)] = mode_val
+                    try:
+                        X_processed[:, idx] = le.fit_transform(col_data.astype(str))
+                    except:
+                        pass
+        
+        # 处理数值特征的缺失值
+        for col in range(X_processed.shape[1]):
+            col_data = X_processed[:, col]
+            if np.any(pd.isnull(col_data)):
+                # 尝试用中位数填充
+                try:
+                    median_val = np.nanmedian(col_data.astype(float))
+                    col_data[pd.isnull(col_data)] = median_val
+                except:
+                    # 如果转换失败，用众数填充
+                    mode_val = pd.Series(col_data).mode()[0] if len(pd.Series(col_data).mode()) > 0 else 0
+                    col_data[pd.isnull(col_data)] = mode_val
+                X_processed[:, col] = col_data
+        
+        # 确保所有特征为数值类型
+        X_processed = X_processed.astype(np.float64)
+        
+        # Z-score标准化
+        if scaler is None:
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X_processed)
+        else:
+            X_scaled = scaler.transform(X_processed)
+    else:
+        X_scaled = None
+    
+    # 处理标签
+    if y_processed is not None:
+        # 处理缺失值
+        if np.any(pd.isnull(y_processed)):
+            mode_val = pd.Series(y_processed).mode()[0] if len(pd.Series(y_processed).mode()) > 0 else 0
+            y_processed[pd.isnull(y_processed)] = mode_val
+        
+        # 标签编码（如果是字符串类型）
+        if y_processed.dtype == object or y_processed.dtype == np.str_:
+            if label_encoder is None:
+                label_encoder = LabelEncoder()
+                y_processed = label_encoder.fit_transform(y_processed)
+            else:
+                y_processed = label_encoder.transform(y_processed)
+        else:
+            y_processed = y_processed.astype(np.int64)
+    
+    return {
+        'X': X_scaled,
+        'y': y_processed,
+        'scaler': scaler,
+        'label_encoder': label_encoder,
+        'n_classes': len(np.unique(y_processed)) if y_processed is not None else 0,
+        'n_features': X_scaled.shape[1] if X_scaled is not None else 0,
+        'n_samples': X_scaled.shape[0] if X_scaled is not None else 0
+    }
+
+# ==================== 7. 数据划分 ====================
+def split_dataset(
+    X: np.ndarray,
+    y: np.ndarray,
+    test_size: float = TEST_SIZE,
+    val_size: float = VAL_SIZE,
+    random_state: int = RANDOM_SEED
+) -> Dict:
+    """
+    按分层抽样划分数据集为训练集、验证集、测试集。
+    """
+    if X is None or y is None:
+        return None
+    
+    # 首先划分训练+验证 和 测试
+    X_train_val, X_test, y_train_val, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=y
+    )
+    
+    # 从训练+验证中划分验证集
+    val_ratio = val_size / (1 - test_size)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train_val, y_train_val, test_size=val_ratio,
+        random_state=random_state, stratify=y_train_val
+    )
+    
+    return {
+        'X_train': X_train,
+        'X_val': X_val,
+        'X_test': X_test,
+        'y_train': y_train,
+        'y_val': y_val,
+        'y_test': y_test,
+        'train_size': len(X_train),
+        'val_size': len(X_val),
+        'test_size': len(X_test)
+    }
+
+# ==================== 8. 单个数据集完整预处理 ====================
+def preprocess_openml_dataset(
+    dataset_id: int,
+    dataset_info: Optional[pd.Series] = None,
+    save_output: bool = True
+) -> Dict:
+    """
+    单个OpenML数据集的完整预处理流程。
+    """
+    print(f"\n{'='*60}")
+    print(f"处理数据集 ID: {dataset_id}")
+    
+    # Step 1: 获取质量指标
+    qualities = fetch_dataset_qualities(dataset_id)
+    if 'error' in qualities:
+        print(f"跳过数据集 {dataset_id}: {qualities['error']}")
+        return None
+    
+    dataset_name = qualities.get('dataset_name', f'dataset_{dataset_id}')
+    print(f"数据集名称: {dataset_name}")
+    print(f"质量指标数量: {len(qualities)}")
+    
+    # Step 2: 加载实际数据
+    X, y, attribute_names, categorical_indicator = load_dataset_data(dataset_id)
+    
+    if X is None or y is None:
+        print(f"跳过数据集 {dataset_id}: 数据加载失败")
+        return None
+    
+    print(f"数据形状: X={X.shape}, y={y.shape}")
+    
+    # Step 3: 特征预处理
+    preprocessed = preprocess_features(
+        X, y, categorical_indicator, attribute_names
+    )
+    
+    if preprocessed['X'] is None:
+        print(f"跳过数据集 {dataset_id}: 特征预处理失败")
+        return None
+    
+    print(f"预处理后: 样本数={preprocessed['n_samples']}, 特征数={preprocessed['n_features']}")
+    
+    # Step 4: 数据划分
+    splits = split_dataset(preprocessed['X'], preprocessed['y'])
+    if splits is None:
+        print(f"跳过数据集 {dataset_id}: 数据划分失败")
+        return None
+    
+    print(f"训练集: {splits['train_size']}, 验证集: {splits['val_size']}, 测试集: {splits['test_size']}")
+    
+    # Step 5: 构建结果
+    results = {
+        'dataset_id': dataset_id,
+        'dataset_name': dataset_name,
+        'qualities': qualities,
+        'X_train': splits['X_train'],
+        'X_val': splits['X_val'],
+        'X_test': splits['X_test'],
+        'y_train': splits['y_train'],
+        'y_val': splits['y_val'],
+        'y_test': splits['y_test'],
+        'scaler': preprocessed['scaler'],
+        'label_encoder': preprocessed['label_encoder'],
+        'n_features': preprocessed['n_features'],
+        'n_classes': preprocessed['n_classes'],
+        'n_samples': preprocessed['n_samples'],
+        'attribute_names': attribute_names,
+        'categorical_indicator': categorical_indicator
+    }
+    
+    # Step 6: 保存结果
+    if save_output:
+        save_preprocessed_data(results)
+    
+    return results
+
+# ==================== 9. 保存与加载预处理数据 ====================
+def save_preprocessed_data(results: Dict):
+    """
+    保存预处理后的数据到磁盘。
+    """
+    dataset_name = results['dataset_name'].replace('/', '_').replace(' ', '_')
+    dataset_dir = os.path.join(OUTPUT_ROOT, f"{results['dataset_id']}_{dataset_name}")
+    os.makedirs(dataset_dir, exist_ok=True)
+    
+    # 保存特征和标签
+    np.save(os.path.join(dataset_dir, 'X_train.npy'), results['X_train'])
+    np.save(os.path.join(dataset_dir, 'X_val.npy'), results['X_val'])
+    np.save(os.path.join(dataset_dir, 'X_test.npy'), results['X_test'])
+    np.save(os.path.join(dataset_dir, 'y_train.npy'), results['y_train'])
+    np.save(os.path.join(dataset_dir, 'y_val.npy'), results['y_val'])
+    np.save(os.path.join(dataset_dir, 'y_test.npy'), results['y_test'])
+    
+    # 保存质量指标
+    qualities_df = pd.DataFrame([results['qualities']])
+    qualities_df.to_csv(os.path.join(dataset_dir, 'qualities.csv'), index=False)
+    
+    # 保存元数据
+    metadata = {
+        'dataset_id': results['dataset_id'],
+        'dataset_name': results['dataset_name'],
+        'n_features': results['n_features'],
+        'n_classes': results['n_classes'],
+        'n_samples': results['n_samples'],
+        'train_size': len(results['X_train']),
+        'val_size': len(results['X_val']),
+        'test_size': len(results['X_test']),
+        'random_seed': RANDOM_SEED,
+        'attribute_names': results['attribute_names'] if results['attribute_names'] is not None else [],
+        'categorical_indicator': results['categorical_indicator'] if results['categorical_indicator'] is not None else []
+    }
+    with open(os.path.join(dataset_dir, 'metadata.json'), 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"数据已保存至: {dataset_dir}")
+
+def load_preprocessed_data(dataset_id: int) -> Dict:
+    """
+    加载已预处理的OpenML数据集。
+    """
+    # 查找对应的数据集目录
+    dataset_dirs = [d for d in os.listdir(OUTPUT_ROOT) if d.startswith(f"{dataset_id}_")]
+    if not dataset_dirs:
+        raise FileNotFoundError(f"未找到数据集 {dataset_id} 的预处理数据")
+    
+    dataset_dir = os.path.join(OUTPUT_ROOT, dataset_dirs[0])
+    
+    with open(os.path.join(dataset_dir, 'metadata.json'), 'r') as f:
+        metadata = json.load(f)
+    
+    qualities_df = pd.read_csv(os.path.join(dataset_dir, 'qualities.csv'))
+    
+    return {
+        'X_train': np.load(os.path.join(dataset_dir, 'X_train.npy')),
+        'X_val': np.load(os.path.join(dataset_dir, 'X_val.npy')),
+        'X_test': np.load(os.path.join(dataset_dir, 'X_test.npy')),
+        'y_train': np.load(os.path.join(dataset_dir, 'y_train.npy')),
+        'y_val': np.load(os.path.join(dataset_dir, 'y_val.npy')),
+        'y_test': np.load(os.path.join(dataset_dir, 'y_test.npy')),
+        'metadata': metadata,
+        'qualities': qualities_df.iloc[0].to_dict()
+    }
+
+# ==================== 10. 批量预处理 ====================
+def preprocess_openml_datasets(
+    dataset_ids: Optional[List[int]] = None,
+    max_datasets: int = 100,
+    min_samples: int = 100,
+    max_samples: int = 100000,
+    save_output: bool = True
+) -> Dict[int, Dict]:
+    """
+    批量预处理OpenML数据集。
+    
+    参数:
+        dataset_ids: 指定的数据集ID列表，如果为None则自动获取
+        max_datasets: 最大处理数量
+        min_samples: 最小样本数过滤
+        max_samples: 最大样本数过滤
+    """
+    # 获取数据集列表
+    if dataset_ids is None:
+        dataset_df = fetch_openml_dataset_list(max_datasets=MAX_DATASETS)
+        # 过滤：选择有足够样本且不太大的数据集
+        if 'NumberOfInstances' in dataset_df.columns:
+            dataset_df = dataset_df[
+                (dataset_df['NumberOfInstances'] >= min_samples) &
+                (dataset_df['NumberOfInstances'] <= max_samples)
+            ]
+        dataset_ids = dataset_df['did'].head(max_datasets).tolist()
+    
+    print(f"\n将处理 {len(dataset_ids)} 个数据集")
+    
+    results = {}
+    failed_count = 0
+    
+    for i, did in enumerate(dataset_ids):
+        try:
+            result = preprocess_openml_dataset(did, save_output=save_output)
+            if result is not None:
+                results[did] = result
+                print(f"成功处理: {did} ({i+1}/{len(dataset_ids)})")
+            else:
+                failed_count += 1
+                print(f"跳过: {did} ({i+1}/{len(dataset_ids)})")
+        except Exception as e:
+            failed_count += 1
+            print(f"处理数据集 {did} 失败: {e}")
+            continue
+        
+        # 避免请求过于频繁
+        time.sleep(0.5)
+    
+    # 保存汇总报告
+    summary = {
+        'total_datasets': len(dataset_ids),
+        'successful': len(results),
+        'failed': failed_count,
+        'processed_ids': list(results.keys()),
+        'failed_ids': [did for did in dataset_ids if did not in results]
+    }
+    
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    with open(os.path.join(OUTPUT_ROOT, 'preprocessing_summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    print(f"\n{'='*60}")
+    print(f"批量预处理完成!")
+    print(f"成功: {len(results)}, 失败: {failed_count}")
+    print(f"汇总报告: {os.path.join(OUTPUT_ROOT, 'preprocessing_summary.json')}")
+    print(f"{'='*60}")
+    
+    return results
+
+# ==================== 11. 质量指标统计分析 ====================
+def analyze_quality_metrics(qualities_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    分析数据集质量指标的统计特征。
+    """
+    # 选择数值列
+    numeric_cols = qualities_df.select_dtypes(include=[np.number]).columns
+    
+    stats = []
+    for col in numeric_cols:
+        if col in ['dataset_id', 'version']:
+            continue
+        stats.append({
+            'metric': col,
+            'count': qualities_df[col].count(),
+            'mean': qualities_df[col].mean(),
+            'std': qualities_df[col].std(),
+            'min': qualities_df[col].min(),
+            'max': qualities_df[col].max(),
+            'missing_rate': qualities_df[col].isnull().mean()
+        })
+    
+    return pd.DataFrame(stats)
+
+# ==================== 12. 主程序入口 ====================
+if __name__ == "__main__":
+    print("="*60)
+    print("OpenML 数据集预处理流水线")
+    print("论文: A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets")
+    print(f"目标数据集数量: {MAX_DATASETS}")
+    print("="*60)
+    
+    # 示例1: 获取数据集列表
+    print("\n[步骤1] 获取OpenML数据集列表")
+    dataset_df = fetch_openml_dataset_list(max_datasets=100)
+    print(f"获取到 {len(dataset_df)} 个数据集")
+    print(dataset_df.head())
+    
+    # 示例2: 获取单个数据集的质量指标
+    print("\n[步骤2] 获取单个数据集质量指标 (ID=61, iris)")
+    qualities = fetch_dataset_qualities(61)
+    print(f"质量指标数量: {len(qualities)}")
+    print(f"部分指标: {list(qualities.keys())[:10]}")
+    
+    # 示例3: 预处理单个数据集
+    print("\n[步骤3] 预处理单个数据集 (ID=61, iris)")
+    result = preprocess_openml_dataset(61)
+    if result:
+        print(f"数据集 {result['dataset_name']} 预处理完成")
+        print(f"样本数: {result['n_samples']}, 特征数: {result['n_features']}")
+    
+    # 示例4: 批量预处理（可选，取消注释以执行）
+    # print("\n[步骤4] 批量预处理数据集")
+    # # 选择一些常用的数据集ID
+    # popular_ids = [61, 31, 1462, 40981, 40982, 40983, 40984, 40985, 40986, 40987]
+    # results = preprocess_openml_datasets(dataset_ids=popular_ids, max_datasets=10)
+    
+    # 示例5: 加载已预处理的数据
+    print("\n[步骤5] 加载已预处理的数据 (ID=61)")
+    try:
+        loaded = load_preprocessed_data(61)
+        print(f"加载成功: {loaded['metadata']['dataset_name']}")
+        print(f"训练集形状: {loaded['X_train'].shape}")
+    except FileNotFoundError:
+        print("请先运行预处理步骤3")
+    
+    print("\n" + "="*60)
+    print("预处理流程演示完成！")
+    print(f"输出目录: {OUTPUT_ROOT}")
+    print("="*60)
