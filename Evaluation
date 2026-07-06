@@ -1,0 +1,387 @@
+"""
+模块10：评估指标 (evaluation/metrics.py)
+论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
+功能：实现论文中使用的所有评估指标，包括：
+- MSE (均方误差)
+- MAE (平均绝对误差)
+- RMSE (均方根误差)
+- R² (决定系数)
+- 方向准确性 (Directional Accuracy, DA)
+- 时序指标 (Temporal MAE, Temporal RMSE)
+- 支持消融实验分析 (AblationAnalyzer)
+参考论文结果：
+- MSE: 0.123 (DLG), 0.082 (OpenML)
+- R²: 0.832 (DLG), 0.912 (OpenML)
+- DA: 80.2% (DLG), 84.5% (OpenML)
+"""
+
+import numpy as np
+import torch
+from typing import Union, List, Dict, Optional, Tuple
+
+
+class Metrics:
+    """
+    静态评估指标集合，支持numpy和PyTorch张量。
+    """
+
+    @staticmethod
+    def _to_numpy(x):
+        """将输入转换为numpy数组（如果可能）"""
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return np.array(x)
+
+    @staticmethod
+    def mse(predictions, targets) -> float:
+        """
+        均方误差 (Mean Squared Error)
+        公式: MSE = (1/n) * Σ (v_i - v̂_i)^2
+        """
+        pred = Metrics._to_numpy(predictions)
+        targ = Metrics._to_numpy(targets)
+        return np.mean((pred - targ) ** 2)
+
+    @staticmethod
+    def mae(predictions, targets) -> float:
+        """
+        平均绝对误差 (Mean Absolute Error)
+        公式: MAE = (1/n) * Σ |v_i - v̂_i|
+        """
+        pred = Metrics._to_numpy(predictions)
+        targ = Metrics._to_numpy(targets)
+        return np.mean(np.abs(pred - targ))
+
+    @staticmethod
+    def rmse(predictions, targets) -> float:
+        """
+        均方根误差 (Root Mean Squared Error)
+        RMSE = sqrt(MSE)
+        """
+        return np.sqrt(Metrics.mse(predictions, targets))
+
+    @staticmethod
+    def r2_score(predictions, targets) -> float:
+        """
+        决定系数 (R² Score)
+        公式: R² = 1 - Σ(v_i - v̂_i)² / Σ(v_i - v̄)²
+        其中 v̄ 为目标值的均值
+        """
+        pred = Metrics._to_numpy(predictions)
+        targ = Metrics._to_numpy(targets)
+        ss_res = np.sum((targ - pred) ** 2)
+        ss_tot = np.sum((targ - np.mean(targ)) ** 2)
+        if ss_tot == 0:
+            return 1.0
+        return 1 - (ss_res / ss_tot)
+
+    @staticmethod
+    def direction_accuracy(predictions, targets) -> float:
+        """
+        方向准确性 (Directional Accuracy, DA)
+        计算预测值变化方向与真实值变化方向匹配的比例。
+        公式: DA = (1/(n(T-1))) * Σ_i Σ_t I(sgn(v_{i,t} - v_{i,t-1}) == sgn(v̂_{i,t} - v̂_{i,t-1}))
+        支持多维数据:
+        - 如果输入是1D，则视为单个时间序列。
+        - 如果输入是2D，则第一维为样本数，第二维为时间步。
+        - 如果输入是3D，则第一维为batch，第二维为节点数，第三维为时间步（展平处理）。
+        """
+        pred = Metrics._to_numpy(predictions)
+        targ = Metrics._to_numpy(targets)
+
+        # 确保维度一致
+        assert pred.shape == targ.shape, "预测值和真实值必须形状相同"
+
+        # 如果形状是 (batch, N, T) 或 (batch, T)，我们将时间步放在最后
+        # 如果只有一维，假设为时间序列 [T]
+        if pred.ndim == 1:
+            # 单个序列
+            pred_diff = np.diff(pred)   # [T-1]
+            targ_diff = np.diff(targ)
+            if len(pred_diff) == 0:
+                return 1.0  # 没有时间步时认为正确
+            # 符号匹配
+            sign_match = np.sign(pred_diff) == np.sign(targ_diff)
+            return np.mean(sign_match)
+
+        elif pred.ndim == 2:
+            # 形状 (N, T) 或 (batch, T) — 将第一维视为样本，第二维为时间
+            # 计算每个样本的方向准确性，然后平均
+            if pred.shape[0] < pred.shape[1]:
+                # 如果 N < T，可能为 (batch, T)，转置
+                pred = pred.T
+                targ = targ.T
+            # 现在形状为 (N, T)
+            N, T = pred.shape
+            if T <= 1:
+                return 1.0
+            pred_diff = np.diff(pred, axis=1)   # (N, T-1)
+            targ_diff = np.diff(targ, axis=1)
+            sign_match = np.sign(pred_diff) == np.sign(targ_diff)
+            return np.mean(sign_match)
+
+        elif pred.ndim == 3:
+            # 形状 (batch, N, T) 或 (batch, T, N)
+            # 我们将时间步放在最后一维，如果时间步在第二维则转置
+            if pred.shape[2] == 1:  # 可能时间步在第二维
+                # 假设 (batch, T, N) -> 交换后两维为 (batch, N, T)
+                pred = np.transpose(pred, (0, 2, 1))
+                targ = np.transpose(targ, (0, 2, 1))
+            # 现在 (batch, N, T)
+            batch, N, T = pred.shape
+            if T <= 1:
+                return 1.0
+            pred_diff = np.diff(pred, axis=2)   # (batch, N, T-1)
+            targ_diff = np.diff(targ, axis=2)
+            sign_match = np.sign(pred_diff) == np.sign(targ_diff)
+            return np.mean(sign_match)
+
+        else:
+            # 更高维度，展平除时间步外的所有维度
+            # 假设最后一维为时间步
+            shape = pred.shape
+            if shape[-1] <= 1:
+                return 1.0
+            pred_flat = pred.reshape(-1, shape[-1])
+            targ_flat = targ.reshape(-1, shape[-1])
+            pred_diff = np.diff(pred_flat, axis=1)
+            targ_diff = np.diff(targ_flat, axis=1)
+            sign_match = np.sign(pred_diff) == np.sign(targ_diff)
+            return np.mean(sign_match)
+
+    @staticmethod
+    def compute_all_metrics(predictions, targets) -> Dict[str, float]:
+        """
+        计算所有基本指标并返回字典。
+        """
+        return {
+            'mse': Metrics.mse(predictions, targets),
+            'mae': Metrics.mae(predictions, targets),
+            'rmse': Metrics.rmse(predictions, targets),
+            'r2': Metrics.r2_score(predictions, targets),
+            'direction_accuracy': Metrics.direction_accuracy(predictions, targets)
+        }
+
+
+class TemporalMetrics:
+    """
+    时序评估指标，用于多步预测。
+    """
+
+    @staticmethod
+    def _to_numpy(x):
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return np.array(x)
+
+    @staticmethod
+    def temporal_mae(pred_seq, target_seq) -> float:
+        """
+        时序MAE：计算所有时间步的平均绝对误差（所有时间步MAE的平均值）。
+        论文公式: TMAE = (1/(T*n)) * Σ_t Σ_i |v_{i,t} - v̂_{i,t}|
+        输入形状: (batch, seq_len, N) 或 (seq_len, N) 或 (batch, N, seq_len)
+        """
+        pred = TemporalMetrics._to_numpy(pred_seq)
+        targ = TemporalMetrics._to_numpy(target_seq)
+        assert pred.shape == targ.shape, "预测序列和真实序列形状必须一致"
+
+        # 确保时间步在最后一维
+        # 如果形状为 (seq_len, N)，则转置为 (N, seq_len)
+        if pred.ndim == 2 and pred.shape[0] > pred.shape[1]:
+            # 假设 (seq_len, N)
+            pred = pred.T
+            targ = targ.T
+        # 现在形状可能是 (seq_len, N) 或 (batch, seq_len, N)
+        # 为了统一，将batch和节点合并，但保留时间步
+        if pred.ndim == 3:
+            # (batch, seq_len, N) -> 合并batch和节点
+            B, T, N = pred.shape
+            pred_flat = pred.reshape(B*N, T)
+            targ_flat = targ.reshape(B*N, T)
+            return np.mean(np.abs(pred_flat - targ_flat))
+        elif pred.ndim == 2:
+            # (seq_len, N) 或 (N, seq_len) —— 假设第一维为时间步
+            return np.mean(np.abs(pred - targ))
+        else:
+            # 展平除时间步外所有维度
+            shape = pred.shape
+            T = shape[-1]
+            pred_flat = pred.reshape(-1, T)
+            targ_flat = targ.reshape(-1, T)
+            return np.mean(np.abs(pred_flat - targ_flat))
+
+    @staticmethod
+    def temporal_rmse(pred_seq, target_seq) -> float:
+        """
+        时序RMSE：计算所有时间步的均方根误差（所有时间步RMSE的平均值或整体RMSE）。
+        这里采用整体RMSE（即所有预测值一起计算RMSE）。
+        """
+        return np.sqrt(TemporalMetrics.temporal_mse(pred_seq, target_seq))
+
+    @staticmethod
+    def temporal_mse(pred_seq, target_seq) -> float:
+        """时序MSE（整体）"""
+        pred = TemporalMetrics._to_numpy(pred_seq)
+        targ = TemporalMetrics._to_numpy(target_seq)
+        return np.mean((pred - targ) ** 2)
+
+    @staticmethod
+    def forecast_skill_score(pred_seq, target_seq, persistence_forecast=None) -> float:
+        """
+        预测技能评分 (Forecast Skill Score, FSS) 或 持续性模型对比。
+        如果未提供持续性预测，则使用目标序列的最后一个观测值作为持续性预测。
+        公式: FSS = 1 - (MSE_pred / MSE_persist)
+        范围: (-∞, 1]，1表示完美预测，0表示与持续性模型相同，负值表示更差。
+        """
+        pred = TemporalMetrics._to_numpy(pred_seq)
+        targ = TemporalMetrics._to_numpy(target_seq)
+        mse_pred = np.mean((pred - targ) ** 2)
+
+        if persistence_forecast is None:
+            # 使用目标序列的最后一个值作为持续性预测（针对每个序列）
+            # 假设输入形状为 (seq_len, N) 或 (batch, seq_len, N)
+            if pred.ndim == 2:
+                # (seq_len, N) 或 (N, seq_len) 假设时间步在第一维
+                # 取最后一个时间步的值
+                last_values = targ[-1]  # (N,)
+                persist = np.repeat(last_values[np.newaxis, :], targ.shape[0], axis=0)
+            elif pred.ndim == 3:
+                # (batch, seq_len, N)
+                last_values = targ[:, -1, :]  # (batch, N)
+                persist = np.repeat(last_values[:, np.newaxis, :], targ.shape[1], axis=1)
+            else:
+                raise ValueError("不支持的维度形状")
+        else:
+            persist = TemporalMetrics._to_numpy(persistence_forecast)
+
+        mse_persist = np.mean((persist - targ) ** 2)
+        if mse_persist == 0:
+            return 1.0 if mse_pred == 0 else -np.inf
+        return 1 - (mse_pred / mse_persist)
+
+
+class AblationAnalyzer:
+    """
+    消融实验分析器，用于评估各个组件对模型性能的贡献。
+    支持计算各消融变体与完整模型的性能差异。
+    """
+
+    def __init__(self, full_model_metrics: Dict[str, float]):
+        """
+        Args:
+            full_model_metrics: 完整模型的评估指标字典。
+        """
+        self.full_metrics = full_model_metrics
+
+    def compute_ablation_results(self, ablation_metrics: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+        """
+        计算每个消融变体相对于完整模型的性能变化。
+        Args:
+            ablation_metrics: {ablation_name: {metric_name: value}}
+        Returns:
+            {ablation_name: {metric_name: change}} 其中 change = ablation - full (对于损失类指标)
+            对于R²，change = full - ablation (因为R²越大越好)
+        """
+        results = {}
+        for name, metrics in ablation_metrics.items():
+            changes = {}
+            for metric, value in metrics.items():
+                if metric in self.full_metrics:
+                    full_val = self.full_metrics[metric]
+                    if metric in ['r2', 'direction_accuracy']:
+                        # 这些指标越大越好，变化 = 完整 - 消融 (正数表示完整更好)
+                        changes[metric] = full_val - value
+                    else:
+                        # 其他指标（MSE, MAE, RMSE）越小越好，变化 = 消融 - 完整 (正数表示消融更差)
+                        changes[metric] = value - full_val
+                else:
+                    changes[metric] = None
+            results[name] = changes
+        return results
+
+    def analyze_component_contribution(self,
+                                       ablation_metrics: Dict[str, Dict[str, float]],
+                                       metric: str = 'mse') -> Dict[str, float]:
+        """
+        分析每个组件对特定指标的贡献程度（相对于完整模型）。
+        返回每个消融变体在该指标上的退化程度。
+        """
+        results = {}
+        full_val = self.full_metrics.get(metric, None)
+        if full_val is None:
+            raise ValueError(f"完整模型指标 '{metric}' 不存在")
+
+        for name, metrics in ablation_metrics.items():
+            if metric in metrics:
+                val = metrics[metric]
+                # 计算相对退化百分比
+                if metric in ['r2', 'direction_accuracy']:
+                    # 越大越好，退化 = (完整 - 消融) / 完整 * 100
+                    if full_val != 0:
+                        degradation = ((full_val - val) / full_val) * 100
+                    else:
+                        degradation = np.nan
+                else:
+                    # 越小越好，退化 = (消融 - 完整) / 完整 * 100
+                    if full_val != 0:
+                        degradation = ((val - full_val) / full_val) * 100
+                    else:
+                        degradation = np.nan
+                results[name] = degradation
+        return results
+
+    def generate_ablation_report(self, ablation_metrics: Dict[str, Dict[str, float]]) -> str:
+        """
+        生成格式化报告。
+        """
+        report_lines = ["=== 消融实验分析报告 ==="]
+        report_lines.append(f"完整模型指标: {self.full_metrics}")
+
+        # 计算每个变体的变化
+        changes = self.compute_ablation_results(ablation_metrics)
+        report_lines.append("\n各消融变体相对于完整模型的性能变化:")
+        for name, change_dict in changes.items():
+            line = f"  {name}:"
+            for metric, change in change_dict.items():
+                if change is not None:
+                    sign = "+" if change > 0 else ""
+                    line += f" {metric}={sign}{change:.4f}"
+            report_lines.append(line)
+
+        # 计算贡献百分比（以MSE为例）
+        print("\n组件贡献分析 (以MSE为准，退化百分比):")
+        contributions = self.analyze_component_contribution(ablation_metrics, 'mse')
+        for name, deg in contributions.items():
+            print(f"  {name}: {deg:.2f}% 退化")
+
+        return "\n".join(report_lines)
+
+
+if __name__ == "__main__":
+    # 测试基本指标
+    np.random.seed(42)
+    pred = np.random.randn(100, 1) * 0.5 + 1.0
+    target = np.random.randn(100, 1) + 1.0
+
+    metrics = Metrics()
+    print("MSE:", metrics.mse(pred, target))
+    print("MAE:", metrics.mae(pred, target))
+    print("RMSE:", metrics.rmse(pred, target))
+    print("R²:", metrics.r2_score(pred, target))
+
+    # 方向准确性测试
+    pred_seq = np.array([1.0, 1.2, 1.1, 1.5, 1.3])
+    target_seq = np.array([1.0, 1.3, 1.0, 1.6, 1.4])
+    da = metrics.direction_accuracy(pred_seq, target_seq)
+    print("方向准确性 (DA):", da)
+
+    # 批量测试
+    all_metrics = metrics.compute_all_metrics(pred, target)
+    print("所有指标:", all_metrics)
+
+    # 时序指标
+    temporal = TemporalMetrics()
+    pred_seq = np.random.randn(10, 32, 5)  # (seq_len, batch, N)
+    target_seq = np.random.randn(10, 32, 5)
+    print("Temporal MAE:", temporal.temporal_mae(pred_seq, target_seq))
+    print("Temporal RMSE:", temporal.temporal_rmse(pred_seq, target_seq))
