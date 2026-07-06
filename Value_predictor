@@ -1,0 +1,234 @@
+"""
+模块6：值预测头 (value_predictor.py)
+论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
+功能：预测数据资产动态价值 v_i(t)，输出价值评分。
+支持单步预测和多步预测（例如10步预测地平线）。
+将节点隐状态映射为实数值，并可结合时间序列预测未来价值演化。
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, List, Union, Tuple
+
+
+class ValuePredictionHead(nn.Module):
+    """
+    值预测头：将节点嵌入（来自GAT+GRU）映射为数据资产价值标量。
+    支持批量输入、多步时间序列预测。
+    可配置为线性回归或MLP。
+    """
+
+    def __init__(self,
+                 input_dim: int,
+                 hidden_dims: Optional[List[int]] = None,
+                 output_dim: int = 1,
+                 activation: str = 'leaky_relu',
+                 dropout: float = 0.1,
+                 use_batch_norm: bool = False):
+        """
+        Args:
+            input_dim: 输入嵌入维度（通常为GRU的隐层维度，论文中为64）
+            hidden_dims: 隐藏层维度列表，若为None则使用单层线性映射
+            output_dim: 输出维度（默认为1，即价值标量）
+            activation: 激活函数类型，'leaky_relu' 或 'relu'
+            dropout: dropout率
+            use_batch_norm: 是否使用BatchNorm
+        """
+        super(ValuePredictionHead, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+
+        # 选择激活函数
+        if activation.lower() == 'leaky_relu':
+            self.activation = nn.LeakyReLU(0.2)
+        elif activation.lower() == 'relu':
+            self.activation = nn.ReLU()
+        else:
+            raise ValueError(f"不支持的激活函数: {activation}")
+
+        # 构建MLP
+        layers = []
+        prev_dim = input_dim
+        if hidden_dims is not None:
+            for h_dim in hidden_dims:
+                layers.append(nn.Linear(prev_dim, h_dim))
+                if use_batch_norm:
+                    layers.append(nn.BatchNorm1d(h_dim))
+                layers.append(self.activation)
+                layers.append(nn.Dropout(dropout))
+                prev_dim = h_dim
+        else:
+            # 如果没有隐藏层，直接线性映射
+            pass
+
+        # 输出层
+        layers.append(nn.Linear(prev_dim, output_dim))
+
+        self.mlp = nn.Sequential(*layers)
+
+        # 可选的缩放因子（使输出在合理范围，例如归一化到[0,1]）
+        self.register_buffer('scale', torch.tensor(1.0))
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        单步预测：将节点嵌入映射为价值。
+
+        Args:
+            embeddings: [batch_size, input_dim] 或 [batch_size, seq_len, input_dim]
+                        如果是3D，则沿序列维度逐帧预测。
+
+        Returns:
+            values: [batch_size, output_dim] 或 [batch_size, seq_len, output_dim]
+        """
+        return self.mlp(embeddings)
+
+    def predict_values(self,
+                       embeddings: torch.Tensor,
+                       apply_activation: bool = False) -> torch.Tensor:
+        """
+        预测价值，与forward相同，但可额外应用激活（例如sigmoid将价值限制在[0,1]）。
+
+        Args:
+            embeddings: 节点嵌入
+            apply_activation: 是否应用sigmoid（用于价值归一化）
+
+        Returns:
+            values: 预测价值
+        """
+        values = self.mlp(embeddings)
+        if apply_activation:
+            values = torch.sigmoid(values)
+        return values
+
+    def predict_multi_step(self,
+                           embeddings_seq: torch.Tensor,
+                           apply_activation: bool = False) -> torch.Tensor:
+        """
+        多步预测：对时间序列的每个时间步预测价值。
+
+        Args:
+            embeddings_seq: [batch_size, n_steps, input_dim] 时间步序列的嵌入
+            apply_activation: 是否应用sigmoid
+
+        Returns:
+            values_seq: [batch_size, n_steps, output_dim] 每个时间步的价值
+        """
+        # 展平序列维度与批量维度进行预测，再恢复形状
+        batch_size, n_steps, embed_dim = embeddings_seq.shape
+        flat_emb = embeddings_seq.reshape(-1, embed_dim)  # [batch*n_steps, embed_dim]
+        flat_values = self.mlp(flat_emb)  # [batch*n_steps, output_dim]
+        if apply_activation:
+            flat_values = torch.sigmoid(flat_values)
+        values_seq = flat_values.view(batch_size, n_steps, self.output_dim)
+        return values_seq
+
+    def compute_value_trajectories(self,
+                                   node_embeddings_dict: dict,
+                                   timestamps: List[int],
+                                   apply_activation: bool = False) -> dict:
+        """
+        计算给定节点在不同时间戳的价值轨迹。
+
+        Args:
+            node_embeddings_dict: {node_id: torch.Tensor [T, input_dim]} 每个节点在不同时间步的嵌入
+            timestamps: 时间戳列表（与嵌入的时间步对应）
+            apply_activation: 是否应用sigmoid
+
+        Returns:
+            trajectories: {node_id: np.array或list} 价值随时间变化的轨迹
+        """
+        trajectories = {}
+        for node_id, emb_seq in node_embeddings_dict.items():
+            # emb_seq: [T, embed_dim]
+            values = self.mlp(emb_seq)  # [T, output_dim]
+            if apply_activation:
+                values = torch.sigmoid(values)
+            trajectories[node_id] = {
+                'timestamps': timestamps,
+                'values': values.detach().cpu().numpy().flatten().tolist()
+            }
+        return trajectories
+
+    def forecast_value_evolution(self,
+                                  initial_embedding: torch.Tensor,
+                                  future_embeddings: torch.Tensor,
+                                  apply_activation: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        预测未来价值的演化。
+        使用当前嵌入（初始）和未来预测的嵌入序列，输出当前价值和未来价值序列。
+
+        Args:
+            initial_embedding: [batch_size, input_dim] 当前时刻的嵌入
+            future_embeddings: [batch_size, n_future_steps, input_dim] 未来各步的嵌入（由预测模型给出）
+            apply_activation: 是否应用sigmoid
+
+        Returns:
+            current_values: [batch_size, output_dim] 当前价值
+            future_values: [batch_size, n_future_steps, output_dim] 未来价值序列
+        """
+        # 当前价值
+        current_values = self.mlp(initial_embedding)
+        if apply_activation:
+            current_values = torch.sigmoid(current_values)
+
+        # 未来价值
+        future_values = self.predict_multi_step(future_embeddings, apply_activation)
+
+        return current_values, future_values
+
+    def set_scale(self, scale_value: float):
+        """设置输出缩放因子（用于归一化）"""
+        self.scale.fill_(scale_value)
+
+
+# ==================== 使用示例 ====================
+if __name__ == "__main__":
+    # 参数配置（论文：GRU隐层64，预测头可为单层线性）
+    input_dim = 64          # GRU隐层维度
+    output_dim = 1          # 价值标量
+    batch_size = 32
+    seq_len = 10            # 时间步数（用于多步预测）
+
+    # 创建值预测头（使用MLP）
+    predictor = ValuePredictionHead(
+        input_dim=input_dim,
+        hidden_dims=[128, 64],  # 可选的隐藏层
+        output_dim=output_dim,
+        activation='leaky_relu',
+        dropout=0.1
+    )
+
+    # 生成测试数据（实际中由前面的模块产生）
+    # 单步嵌入 [batch, input_dim]
+    embeddings = torch.randn(batch_size, input_dim)
+
+    # 单步预测
+    values = predictor.predict_values(embeddings, apply_activation=True)
+    print(f"单步预测价值形状: {values.shape}")  # [32, 1]
+
+    # 多步嵌入 [batch, seq_len, input_dim]
+    embeddings_seq = torch.randn(batch_size, seq_len, input_dim)
+
+    # 多步预测
+    values_seq = predictor.predict_multi_step(embeddings_seq, apply_activation=True)
+    print(f"多步预测价值形状: {values_seq.shape}")  # [32, 10, 1]
+
+    # 计算价值轨迹（模拟节点ID）
+    node_embeddings_dict = {
+        'node_1': torch.randn(seq_len, input_dim),
+        'node_2': torch.randn(seq_len, input_dim)
+    }
+    timestamps = list(range(seq_len))
+    trajectories = predictor.compute_value_trajectories(node_embeddings_dict, timestamps, apply_activation=True)
+    for node_id, traj in trajectories.items():
+        print(f"节点 {node_id} 的价值轨迹: {len(traj['values'])} 个时间点")
+
+    # 预测未来价值演化
+    initial_emb = torch.randn(batch_size, input_dim)
+    future_emb = torch.randn(batch_size, 5, input_dim)  # 未来5步
+    current_val, future_vals = predictor.forecast_value_evolution(initial_emb, future_emb, apply_activation=True)
+    print(f"当前价值形状: {current_val.shape}")  # [32, 1]
+    print(f"未来价值形状: {future_vals.shape}")  # [32, 5, 1]
+
+    print("\n值预测头模块测试完成。")
