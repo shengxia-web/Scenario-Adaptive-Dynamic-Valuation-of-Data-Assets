@@ -1,0 +1,467 @@
+"""
+模块7：集成模型 (integrated_model.py)
+论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
+功能：将所有组件整合为完整的场景自适应动态模型。
+      实现完整的前向传播：输入图 → GAT编码 → 场景适配 → GRU解码 → 值预测。
+      支持注意力权重提取、损失计算、多步预测。
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, List, Optional, Tuple, Union
+import numpy as np
+
+# 导入各个模块（假设各模块已在同一目录下）
+from gat_encoder import GATEncoder
+from gru_decoder import GRUDecoderWithCell
+from context_adapter import ContextAdapter
+from attention_mechanism import MultiHeadAttention
+from value_predictor import ValuePredictionHead
+
+
+class ScenarioAdaptiveValuationModel(nn.Module):
+    """
+    场景自适应数据资产动态估值模型。
+    集成GAT编码器、GRU解码器、上下文适配器和值预测头。
+    支持图结构输入、场景自适应重加权、时序动态预测。
+    """
+
+    def __init__(self,
+                 node_feature_dim: int = 5,          # 节点特征维度 [q, f, c, r, cost]
+                 gat_hidden_dim: int = 128,           # GAT隐层维度
+                 gat_heads: int = 8,                  # GAT注意力头数
+                 gat_layers: int = 2,                 # GAT层数
+                 gat_dropout: float = 0.3,
+                 gru_hidden_dim: int = 64,            # GRU隐层维度
+                 gru_layers: int = 1,
+                 context_embed_dim: int = 32,
+                 scenario_feature_dim: int = 16,
+                 env_feature_dim: int = 8,
+                 value_hidden_dims: Optional[List[int]] = None,  # 值预测头隐藏层
+                 num_heads_attention: int = 8,        # 用于自适应重加权的注意力头数
+                 use_context: bool = True,
+                 use_attention_in_context: bool = True,
+                 dropout: float = 0.3):
+        """
+        Args:
+            node_feature_dim: 输入节点特征维度
+            gat_hidden_dim: GAT输出维度（每层输出）
+            gat_heads: GAT注意力头数
+            gat_layers: GAT层数
+            gat_dropout: GAT dropout
+            gru_hidden_dim: GRU隐层维度
+            gru_layers: GRU层数（论文为1）
+            context_embed_dim: 上下文嵌入维度
+            scenario_feature_dim: 场景特征维度
+            env_feature_dim: 环境特征维度
+            value_hidden_dims: 值预测头隐藏层维度列表（若None则单层线性）
+            num_heads_attention: 用于特征重加权的多头注意力头数
+            use_context: 是否启用上下文（消融实验控制）
+            use_attention_in_context: 上下文重加权是否使用注意力机制
+            dropout: 全局dropout
+        """
+        super(ScenarioAdaptiveValuationModel, self).__init__()
+
+        self.node_feature_dim = node_feature_dim
+        self.gat_hidden_dim = gat_hidden_dim
+        self.gru_hidden_dim = gru_hidden_dim
+        self.use_context = use_context
+
+        # 1. GAT编码器
+        self.gat_encoder = GATEncoder(
+            in_channels=node_feature_dim,
+            hidden_dim=gat_hidden_dim,
+            out_channels=gat_hidden_dim,  # 保持与hidden_dim一致
+            heads=gat_heads,
+            n_layers=gat_layers,
+            dropout=gat_dropout,
+            concat=True,
+            add_self_loops=True,
+            edge_weight_scale=True
+        )
+
+        # 2. 场景适配器（上下文编码和特征重加权）
+        self.context_adapter = ContextAdapter(
+            scenario_feature_dim=scenario_feature_dim,
+            env_feature_dim=env_feature_dim,
+            context_embed_dim=context_embed_dim,
+            feature_dim=node_feature_dim,   # 原始特征维度用于重加权
+            use_context=use_context,
+            use_attention_weighting=use_attention_in_context,
+            dropout=dropout
+        )
+
+        # 注意：GAT的输出维度为 gat_hidden_dim，但GRU输入需要合并消息和特征
+        # 论文中GRU输入为 [m_i(t), x_i(t+1)]，其中消息来自GAT，特征为原始特征（或调整后特征）
+        # 我们设计GRU输入维度 = gat_hidden_dim + node_feature_dim（或调整后特征维度）
+        # 但为了灵活，我们使用一个投影层将拼接后的向量映射到合适维度
+        self.gru_input_dim = gat_hidden_dim + node_feature_dim
+        self.gru_input_proj = nn.Linear(self.gru_input_dim, gru_hidden_dim)  # 投影到GRU输入空间
+
+        # 3. GRU解码器（使用带Cell的版本）
+        self.gru_decoder = GRUDecoderWithCell(
+            input_dim=gru_hidden_dim,
+            hidden_dim=gru_hidden_dim,
+            n_layers=gru_layers,
+            dropout=dropout,
+            activation='leaky_relu'
+        )
+
+        # 4. 值预测头
+        if value_hidden_dims is None:
+            value_hidden_dims = [64, 32]  # 默认两层
+        self.value_predictor = ValuePredictionHead(
+            input_dim=gru_hidden_dim,
+            hidden_dims=value_hidden_dims,
+            output_dim=1,
+            activation='leaky_relu',
+            dropout=dropout
+        )
+
+        # 可选：额外添加一个注意力层用于信息融合（但论文未明确，可留作扩展）
+        # 这里我们保留接口，但实际前向中不使用
+
+        # 存储中间结果以便解释
+        self._attention_weights = None
+        self._context_embedding = None
+
+    def forward(self,
+                node_features: torch.Tensor,
+                edge_index: torch.Tensor,
+                edge_attr: torch.Tensor,
+                scenario_params: Optional[torch.Tensor] = None,
+                env_params: Optional[torch.Tensor] = None,
+                time_steps: Optional[int] = None,
+                return_attention: bool = False) -> Dict[str, torch.Tensor]:
+        """
+        完整前向传播。
+
+        Args:
+            node_features: [num_nodes, node_feature_dim] 节点初始特征（可能为t=0时刻）
+            edge_index: [2, num_edges] 边索引
+            edge_attr: [num_edges, 1] 边权重（已归一化）
+            scenario_params: [batch_size, scenario_feature_dim] 场景参数（批量维度可视为节点数或批次）
+            env_params: [batch_size, env_feature_dim] 环境参数
+            time_steps: 时间步数（若为None，则默认使用node_features的最后一维作为时间？实际应提供）
+            return_attention: 是否返回注意力权重
+
+        Returns:
+            dict: 包含 'values' (预测价值序列), 'hidden_states' (GRU隐状态),
+                  'attention' (可选) 等
+        """
+        # 检查输入维度，假设 node_features 为 [num_nodes, node_feature_dim] 或 [batch, num_nodes, features]
+        # 为简化，我们假设输入为 [batch, num_nodes, features]，其中batch可能为1或节点数
+        if node_features.dim() == 2:
+            # 增加批量维度
+            node_features = node_features.unsqueeze(0)  # [1, N, F]
+            batch_size = 1
+            num_nodes = node_features.size(1)
+        else:
+            batch_size, num_nodes, _ = node_features.shape
+
+        # 如果time_steps未指定，我们使用默认1（单步）
+        if time_steps is None:
+            time_steps = 1
+
+        # 1. 使用GAT编码节点（空间消息传递）
+        # 注意：GAT编码器期望输入 [N, F]，不支持批量，我们需遍历批量或重塑
+        # 为简单，我们将批量合并到节点维度，但GAT是无状态的，可以处理所有节点
+        # 将 [batch, N, F] -> [batch*N, F] 进行编码，再恢复
+        flat_features = node_features.view(-1, self.node_feature_dim)  # [batch*N, F]
+        # 边索引需要扩展以匹配批量节点？但图结构通常在每个batch相同，所以我们可以复制边索引
+        # 这里我们假设图结构对所有batch相同，因此边索引不需要扩展，但节点索引需偏移
+        # 更简单：对每个batch独立处理，但我们这里采用批量处理方式：将边索引扩展
+        # 如果batch>1，需要复制图结构
+        if batch_size > 1:
+            # 扩展边索引：为每个batch偏移节点索引
+            offset = torch.arange(batch_size, device=edge_index.device) * num_nodes
+            offset = offset.repeat_interleave(edge_index.size(1))  # [batch*E]
+            expanded_edge_index = edge_index.repeat(1, batch_size) + offset.unsqueeze(0)
+            expanded_edge_index = expanded_edge_index.long()
+            # 边属性也重复
+            expanded_edge_attr = edge_attr.repeat(batch_size, 1)
+        else:
+            expanded_edge_index = edge_index
+            expanded_edge_attr = edge_attr
+
+        # GAT编码
+        gat_embeddings = self.gat_encoder.encode(
+            flat_features, expanded_edge_index, expanded_edge_attr
+        )  # [batch*N, gat_hidden_dim]
+
+        # 恢复批量形状 [batch, N, gat_hidden_dim]
+        gat_embeddings = gat_embeddings.view(batch_size, num_nodes, -1)
+
+        # 2. 场景自适应重加权（对原始节点特征进行调整）
+        # 我们需要批量处理，将每个节点的特征和场景参数对应
+        # 若scenario_params为None，则上下文适配器使用默认零上下文
+        # 注意：上下文适配器期望输入 [batch, feature_dim] 或 [batch, scenario_dim]
+        # 这里我们将每个节点的特征视为一个样本，scenario_params需扩展到节点数
+        if scenario_params is not None:
+            # 扩展场景参数到每个节点：[batch, scenario_dim] -> [batch*N, scenario_dim]
+            scenario_expanded = scenario_params.unsqueeze(1).repeat(1, num_nodes, 1).view(-1, scenario_params.size(-1))
+        else:
+            scenario_expanded = None
+
+        if env_params is not None:
+            env_expanded = env_params.unsqueeze(1).repeat(1, num_nodes, 1).view(-1, env_params.size(-1))
+        else:
+            env_expanded = None
+
+        # 节点特征展平 [batch*N, feature_dim]
+        flat_node_features = node_features.view(-1, self.node_feature_dim)
+
+        # 自适应重加权（返回调整后的特征和权重）
+        adjusted_features, attention_weights = self.context_adapter.adaptive_reweighting(
+            flat_node_features,
+            scenario_params=scenario_expanded,
+            env_params=env_expanded,
+            return_weights=True
+        )
+        # adjusted_features: [batch*N, feature_dim]
+        # 存储注意力权重（用于解释）
+        self._attention_weights = attention_weights.view(batch_size, num_nodes, -1)
+
+        # 3. 构建GRU输入：拼接GAT嵌入和调整后的特征
+        # 形状 [batch*N, gat_hidden_dim + feature_dim]
+        combined = torch.cat([gat_embeddings.view(-1, self.gat_hidden_dim),
+                              adjusted_features], dim=-1)
+        # 投影到GRU输入空间
+        gru_input = self.gru_input_proj(combined)  # [batch*N, gru_hidden_dim]
+
+        # 重塑为 [batch, N, gru_hidden_dim] 作为序列（我们将其视为每个节点独立时序）
+        # 但论文中每个节点的时序是独立的，我们可以将N视为序列长度，batch为节点？
+        # 更合理：每个节点独立处理，所以我们将batch*N作为序列样本，但图结构在时间上不变。
+        # 然而GRU需要时间步维度，我们这里只有一个时间步，若需多步，需要扩展。
+        # 此处我们假设已经有多步特征，但输入只有当前步，所以我们需要循环预测。
+        # 论文中模型是对每个时间步输入图特征，所以我们的forward应支持时间序列输入。
+        # 更合适的接口：输入 node_features_seq [batch, T, N, F]
+        # 但为了简化，我们在此设计为单步预测，若要序列预测，需多次调用。
+        # 我们提供一个辅助函数 predict_over_time。
+
+        # 因为我们的输入是单步，直接通过GRU（序列长度1）
+        # 将gru_input reshape为 [batch*N, 1, gru_hidden_dim]
+        gru_input_seq = gru_input.unsqueeze(1)  # [batch*N, 1, hidden]
+
+        # GRU前向（序列长度1）
+        gru_output, final_hidden = self.gru_decoder.forward(gru_input_seq)
+        # gru_output: [batch*N, 1, gru_hidden_dim]
+        # final_hidden: [1, batch*N, gru_hidden_dim]
+
+        # 取最后时间步的隐状态作为当前嵌入
+        temporal_embeddings = gru_output.squeeze(1)  # [batch*N, gru_hidden_dim]
+
+        # 4. 价值预测
+        values = self.value_predictor.predict_values(temporal_embeddings, apply_activation=True)
+        # values: [batch*N, 1]
+
+        # 重塑为 [batch, N, 1]
+        values = values.view(batch_size, num_nodes, 1)
+
+        # 存储上下文嵌入（用于解释）
+        self._context_embedding = self.context_adapter.get_context_embedding(
+            scenario_params, env_params
+        )
+
+        result = {
+            'values': values,                     # [batch, N, 1]
+            'hidden_states': temporal_embeddings, # [batch*N, gru_hidden_dim]
+            'gat_embeddings': gat_embeddings,     # [batch, N, gat_hidden_dim]
+            'adjusted_features': adjusted_features.view(batch_size, num_nodes, -1),
+            'attention_weights': self._attention_weights,  # [batch, N, feature_dim]
+            'context_embedding': self._context_embedding   # [batch, context_dim]
+        }
+
+        if return_attention:
+            # 还可返回GAT的注意力权重（需从GAT层提取）
+            # 这里我们返回上下文注意力权重
+            result['context_attention'] = attention_weights
+
+        return result
+
+    def predict_over_time(self,
+                          node_features_seq: torch.Tensor,
+                          edge_index: torch.Tensor,
+                          edge_attr: torch.Tensor,
+                          scenario_params: Optional[torch.Tensor] = None,
+                          env_params: Optional[torch.Tensor] = None,
+                          return_attention: bool = False) -> Dict[str, torch.Tensor]:
+        """
+        对时间序列数据进行批量预测。
+        node_features_seq: [T, N, F] 或 [batch, T, N, F] 不同时间步的节点特征
+        返回每个时间步的价值序列。
+        """
+        # 假设输入为 [T, N, F] 无batch维度
+        if node_features_seq.dim() == 3:
+            T, N, F = node_features_seq.shape
+            batch_size = 1
+            # 增加batch维度 [1, T, N, F]
+            node_features_seq = node_features_seq.unsqueeze(0)
+        else:
+            batch_size, T, N, F = node_features_seq.shape
+
+        all_values = []
+        all_hidden = []
+
+        # 对每个时间步独立处理
+        for t in range(T):
+            node_features_t = node_features_seq[:, t, :, :]  # [batch, N, F]
+            # 注意：场景参数如果随时间变化，应该传入对应t的，这里假设静态
+            step_result = self.forward(
+                node_features_t,
+                edge_index,
+                edge_attr,
+                scenario_params,
+                env_params,
+                time_steps=1,
+                return_attention=return_attention
+            )
+            all_values.append(step_result['values'])  # [batch, N, 1]
+            all_hidden.append(step_result['hidden_states'])
+
+        # 堆叠时间维
+        values_seq = torch.stack(all_values, dim=1)  # [batch, T, N, 1]
+        hidden_seq = torch.stack(all_hidden, dim=1)  # [batch*T, N, hidden]? 更合理转为 [batch, T, N, hidden]
+
+        result = {
+            'values_sequence': values_seq,
+            'hidden_sequence': hidden_seq,
+        }
+        return result
+
+    def encode_graph(self,
+                     node_features: torch.Tensor,
+                     edge_index: torch.Tensor,
+                     edge_attr: torch.Tensor) -> torch.Tensor:
+        """仅执行GAT编码，返回节点嵌入"""
+        if node_features.dim() == 2:
+            node_features = node_features.unsqueeze(0)
+        batch_size, num_nodes, _ = node_features.shape
+        flat_features = node_features.view(-1, self.node_feature_dim)
+        # 处理边扩展（与forward类似，但此处假设batch=1简化）
+        gat_emb = self.gat_encoder.encode(flat_features, edge_index, edge_attr)
+        return gat_emb.view(batch_size, num_nodes, -1)
+
+    def adapt_to_scenario(self,
+                          embeddings: torch.Tensor,
+                          scenario_params: Optional[torch.Tensor] = None,
+                          env_params: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """对嵌入或特征应用场景自适应重加权（仅上下文适配）"""
+        # 这里embeddings可能是节点嵌入，但我们实际上需要原始特征进行重加权，更合理的是直接对特征操作
+        # 但为了接口统一，我们允许传入特征
+        if embeddings.dim() == 2:
+            embeddings = embeddings.unsqueeze(0)
+        batch_size, num_nodes, feat_dim = embeddings.shape
+        flat_emb = embeddings.view(-1, feat_dim)
+        if scenario_params is not None:
+            scenario_expanded = scenario_params.unsqueeze(1).repeat(1, num_nodes, 1).view(-1, scenario_params.size(-1))
+        else:
+            scenario_expanded = None
+        if env_params is not None:
+            env_expanded = env_params.unsqueeze(1).repeat(1, num_nodes, 1).view(-1, env_params.size(-1))
+        else:
+            env_expanded = None
+        adjusted, _ = self.context_adapter.adaptive_reweighting(
+            flat_emb, scenario_expanded, env_expanded, return_weights=True
+        )
+        return adjusted.view(batch_size, num_nodes, -1)
+
+    def decode_temporal_evolution(self,
+                                  adapted_embeddings: torch.Tensor,
+                                  additional_input: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """使用GRU解码时间演化（单步或多步）"""
+        # adapted_embeddings: [batch, N, hidden_dim] 或 [batch, seq_len, N, hidden_dim]
+        # 简化：这里假设输入为 [batch*N, seq_len, hidden_dim]
+        if adapted_embeddings.dim() == 3:
+            # 可能是 [batch, seq_len, hidden] 或 [batch*N, seq_len, hidden]
+            # 我们期望 [batch*N, seq_len, hidden]
+            pass
+        # 实际逻辑在GRU中，这里仅作接口
+        gru_out, _ = self.gru_decoder.forward(adapted_embeddings, additional_input)
+        return gru_out
+
+    def predict_asset_values(self,
+                             temporal_embeddings: torch.Tensor) -> torch.Tensor:
+        """从时间嵌入预测价值"""
+        return self.value_predictor.predict_values(temporal_embeddings, apply_activation=True)
+
+    def loss_backward(self,
+                      predictions: torch.Tensor,
+                      targets: torch.Tensor,
+                      loss_type: str = 'mse') -> torch.Tensor:
+        """
+        计算损失并自动反向传播（若需要）。
+        通常外部调用，此处提供便捷方法。
+        """
+        if loss_type == 'mse':
+            loss = F.mse_loss(predictions, targets)
+        elif loss_type == 'mae':
+            loss = F.l1_loss(predictions, targets)
+        elif loss_type == 'huber':
+            loss = F.smooth_l1_loss(predictions, targets)
+        else:
+            raise ValueError(f"不支持的损失类型: {loss_type}")
+        # 不在此处调用backward，由外部控制
+        return loss
+
+if __name__ == "__main__":
+    # 配置参数（与论文一致）
+    node_feature_dim = 5
+    gat_hidden_dim = 128
+    gat_heads = 8
+    gat_layers = 2
+    gat_dropout = 0.3
+    gru_hidden_dim = 64
+    context_embed_dim = 32
+    scenario_feature_dim = 16
+    env_feature_dim = 8
+
+    # 创建模型
+    model = ScenarioAdaptiveValuationModel(
+        node_feature_dim=node_feature_dim,
+        gat_hidden_dim=gat_hidden_dim,
+        gat_heads=gat_heads,
+        gat_layers=gat_layers,
+        gat_dropout=gat_dropout,
+        gru_hidden_dim=gru_hidden_dim,
+        context_embed_dim=context_embed_dim,
+        scenario_feature_dim=scenario_feature_dim,
+        env_feature_dim=env_feature_dim,
+        value_hidden_dims=[64, 32],
+        use_context=True,
+        use_attention_in_context=True
+    )
+
+    # 生成示例输入
+    num_nodes = 50
+    num_edges = 200
+    batch_size = 4  # 批次大小
+
+    node_features = torch.randn(batch_size, num_nodes, node_feature_dim)
+    edge_index = torch.randint(0, num_nodes, (2, num_edges), dtype=torch.long)
+    edge_attr = torch.rand(num_edges, 1)  # 边权重
+    scenario_params = torch.randn(batch_size, scenario_feature_dim)
+    env_params = torch.randn(batch_size, env_feature_dim)
+
+    # 前向传播
+    outputs = model(
+        node_features,
+        edge_index,
+        edge_attr,
+        scenario_params,
+        env_params,
+        time_steps=1,
+        return_attention=True
+    )
+
+    print("预测价值形状:", outputs['values'].shape)  # [4, 50, 1]
+    print("注意力权重形状:", outputs['attention_weights'].shape)  # [4, 50, 5]
+    print("上下文嵌入形状:", outputs['context_embedding'].shape)  # [4, 32]
+
+    # 训练损失计算
+    targets = torch.randn(batch_size, num_nodes, 1)
+    loss = model.loss_backward(outputs['values'], targets, 'mse')
+    print("损失值:", loss.item())
+
+    print("\n集成模型测试完成。")
