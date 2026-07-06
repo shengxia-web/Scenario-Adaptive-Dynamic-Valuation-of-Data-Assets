@@ -1,0 +1,425 @@
+"""
+模块2：GAT编码器 (gat_encoder.py)
+论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
+功能：实现多头图注意力网络编码器，作为空间消息传递组件。
+配置：2层，128维隐层，8头注意力，0.3 dropout，LeakyReLU激活。
+支持边权重作为注意力偏置（论文公式6）。
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import add_self_loops, degree
+from torch_geometric.typing import Adj, OptTensor, Size
+from typing import Optional, Tuple, List, Union
+import numpy as np
+
+
+class GraphAttentionLayer(MessagePassing):
+    """
+    多头图注意力层，支持边权重。
+    基于论文公式：m_{i←j} = MLP_msg([h_j, h_i]) * w_ij
+    注意力系数计算：e_ij = LeakyReLU(a^T [W h_i || W h_j])
+    最终输出：h_i' = ||_{k=1..K} σ( Σ_{j∈N(i)} α_{ij}^k W^k h_j )
+    """
+    
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 heads: int = 1,
+                 concat: bool = True,
+                 negative_slope: float = 0.2,
+                 dropout: float = 0.0,
+                 add_self_loops: bool = True,
+                 bias: bool = True,
+                 edge_weight_scale: bool = True,
+                 **kwargs):
+        """
+        Args:
+            in_channels: 输入特征维度
+            out_channels: 每个头的输出维度（若concat=True，则总输出为 heads * out_channels）
+            heads: 注意力头数
+            concat: 是否将多头输出拼接（若False则平均）
+            negative_slope: LeakyReLU负斜率
+            dropout: 注意力系数的dropout
+            add_self_loops: 是否添加自环
+            bias: 是否使用偏置
+            edge_weight_scale: 是否将边权重作为消息的缩放因子（论文公式6）
+        """
+        super(GraphAttentionLayer, self).__init__(aggr='add', node_dim=0, **kwargs)
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.heads = heads
+        self.concat = concat
+        self.negative_slope = negative_slope
+        self.dropout = dropout
+        self.add_self_loops = add_self_loops
+        self.edge_weight_scale = edge_weight_scale
+
+        # 线性变换矩阵 W：为每个头独立
+        self.lin = nn.Linear(in_channels, heads * out_channels, bias=False)
+
+        # 注意力参数 a：用于计算系数
+        self.att_src = nn.Parameter(torch.Tensor(1, heads, out_channels))
+        self.att_dst = nn.Parameter(torch.Tensor(1, heads, out_channels))
+
+        if bias and concat:
+            self.bias = nn.Parameter(torch.Tensor(heads * out_channels))
+        elif bias and not concat:
+            self.bias = nn.Parameter(torch.Tensor(out_channels))
+        else:
+            self.register_parameter('bias', None)
+
+        self._alpha = None  # 存储最近一次计算的注意力系数
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.lin.reset_parameters()
+        nn.init.xavier_uniform_(self.att_src)
+        nn.init.xavier_uniform_(self.att_dst)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self,
+                x: torch.Tensor,
+                edge_index: Adj,
+                edge_attr: OptTensor = None,
+                size: Size = None,
+                return_attention_weights: bool = False) -> torch.Tensor:
+        """
+        Args:
+            x: 节点特征 [N, in_channels]
+            edge_index: 边索引 [2, E]
+            edge_attr: 边权重 [E, 1] 或 [E, *]
+            size: 用于子图
+            return_attention_weights: 是否返回注意力系数
+
+        Returns:
+            节点嵌入 [N, heads * out_channels] 或 [N, out_channels] (若concat=False)
+        """
+        H, C = self.heads, self.out_channels
+
+        # 线性变换：x -> [N, H*C]
+        x = self.lin(x)  # [N, H*C]
+        x = x.view(-1, H, C)  # [N, H, C]
+
+        # 计算注意力系数所需的源和目标节点特征
+        # 我们使用 propagate 方法，在 message 中计算 alpha
+        # 为了计算边 i->j 的注意力，需要源节点 j 的特征和目标节点 i 的特征
+        # 我们在 message 中获取源节点特征 x_j 和目标节点特征 x_i
+
+        # 添加自环（若需要）
+        if self.add_self_loops:
+            # 注意：edge_attr 也需要处理自环
+            edge_index, edge_attr = add_self_loops(
+                edge_index, edge_attr, fill_value=1.0, num_nodes=x.size(0))
+
+        # 开始消息传播
+        out = self.propagate(edge_index, x=x, edge_attr=edge_attr, size=size)
+
+        # 如果 concat=False，则平均多头输出
+        if not self.concat:
+            out = out.mean(dim=1)  # [N, C]
+
+        # 应用偏置
+        if self.bias is not None:
+            out = out + self.bias
+
+        # 存储注意力系数用于外部访问
+        if return_attention_weights:
+            return out, self._alpha
+        else:
+            return out
+
+    def message(self,
+                x_i: torch.Tensor,
+                x_j: torch.Tensor,
+                edge_attr: OptTensor,
+                index: torch.Tensor,
+                ptr: OptTensor,
+                size_i: int) -> torch.Tensor:
+        """
+        计算消息：对每条边 j->i，计算注意力系数 α_ij，并返回 α_ij * (W x_j)
+        同时，若 edge_weight_scale=True，则乘以边权重 edge_attr
+        """
+        # x_i: [E, H, C], x_j: [E, H, C]
+        # 计算注意力系数 e_ij = LeakyReLU( a_src^T x_j + a_dst^T x_i )
+        # 注意：论文中通常使用 a^T [W h_i || W h_j]，我们采用GATv2的加性形式
+        # 这里实现标准GAT
+        alpha_src = (x_j * self.att_src).sum(dim=-1)  # [E, H]
+        alpha_dst = (x_i * self.att_dst).sum(dim=-1)  # [E, H]
+        alpha = alpha_src + alpha_dst
+        alpha = F.leaky_relu(alpha, self.negative_slope)  # [E, H]
+
+        # 根据边索引计算 softmax 归一化（在目标节点上）
+        # 在 message 中不能直接 softmax，因为需要按目标节点聚合
+        # 我们在 message 中只返回未归一化的 alpha，然后在 aggregate 中归一化
+        # 但是 aggregate 是固定的，无法直接做 softmax。通常做法是在 message 中计算归一化后的系数
+        # 为了简化，我们利用 torch_scatter 或者自定义聚合，但这里我们使用标准方法：
+        # 在 propagate 内部，会先调用 message，然后 aggregate，但 aggregate 不支持 softmax。
+        # 因此，我们在这里只计算未归一化的 alpha，并在 message 中保存，然后在 forward 中手动归一化？
+        # 但更标准的实现是在 propagate 中传入 alpha，并自定义 aggregate。
+        # 为了兼容，我们采用简化：在 message 中直接使用 edge_attr 和注意力系数相乘作为消息权重。
+        # 我们仍返回未归一化的注意力值，但后续在 aggregate 中无法归一化，所以这里我们选择在 message 中完成归一化，
+        # 利用 index 参数计算 softmax。我们可以通过将 alpha 存入 self，然后在 aggregate 后处理，但那样复杂。
+        # 更干净的方式：使用 torch_scatter 的 softmax 函数。
+        from torch_scatter import softmax
+        alpha = softmax(alpha, index, num_nodes=size_i)  # [E, H]
+
+        # 应用 dropout（训练时）
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+
+        # 存储注意力系数用于返回
+        self._alpha = alpha.detach()  # [E, H]
+
+        # 消息：W x_j * alpha
+        msg = x_j * alpha.unsqueeze(-1)  # [E, H, C]
+
+        # 如果边权重可用，并且需要缩放，则乘以 edge_attr
+        if self.edge_weight_scale and edge_attr is not None:
+            # edge_attr 形状可能 [E, 1] 或 [E, *]，我们取第一列
+            if edge_attr.dim() == 1:
+                w = edge_attr.view(-1, 1, 1)  # [E, 1, 1]
+            else:
+                w = edge_attr[:, 0].view(-1, 1, 1)  # 取第一维
+            msg = msg * w
+
+        return msg  # [E, H, C]
+
+    def aggregate(self, inputs: torch.Tensor, index: torch.Tensor,
+                  ptr: Optional[torch.Tensor] = None,
+                  dim_size: Optional[int] = None) -> torch.Tensor:
+        """
+        聚合消息（求和）
+        """
+        # inputs: [E, H, C], index: [E]
+        out = torch.zeros((dim_size, inputs.size(1), inputs.size(2)),
+                          device=inputs.device, dtype=inputs.dtype)
+        out.index_add_(0, index, inputs)
+        return out  # [N, H, C]
+
+    def compute_attention_weights(self) -> Optional[torch.Tensor]:
+        """返回最近一次前向传播的注意力系数（边级多头注意力权重）"""
+        return self._alpha
+
+
+class GATEncoder(nn.Module):
+    """
+    两层多头图注意力编码器，配置：
+    - 2层
+    - 每层隐层维度128（每头输出维度 = hidden_dim // heads）
+    - 8个注意力头
+    - Dropout 0.3
+    - 激活函数 LeakyReLU (negative_slope=0.2)
+    支持边特征（权重）传入。
+    """
+    
+    def __init__(self,
+                 in_channels: int,
+                 hidden_dim: int = 128,
+                 out_channels: Optional[int] = None,
+                 heads: int = 8,
+                 n_layers: int = 2,
+                 dropout: float = 0.3,
+                 negative_slope: float = 0.2,
+                 concat: bool = True,
+                 add_self_loops: bool = True,
+                 edge_weight_scale: bool = True):
+        """
+        Args:
+            in_channels: 输入节点特征维度
+            hidden_dim: 每层输出维度（若concat=True，则每头输出 hidden_dim // heads）
+            out_channels: 最终输出维度（若None，则输出 hidden_dim）
+            heads: 每层注意力头数
+            n_layers: 层数（默认2）
+            dropout: 层间dropout和注意力dropout
+            negative_slope: LeakyReLU斜率
+            concat: 是否在每层拼接多头输出（若False则平均）
+            add_self_loops: 是否添加自环
+            edge_weight_scale: 是否缩放消息
+        """
+        super(GATEncoder, self).__init__()
+
+        self.in_channels = in_channels
+        self.hidden_dim = hidden_dim
+        self.out_channels = out_channels if out_channels is not None else hidden_dim
+        self.heads = heads
+        self.n_layers = n_layers
+        self.dropout = dropout
+        self.concat = concat
+
+        # 计算每头的输出维度
+        head_out = hidden_dim // heads  # 确保整除
+        if hidden_dim % heads != 0:
+            raise ValueError(f"hidden_dim ({hidden_dim}) 必须能被 heads ({heads}) 整除")
+
+        self.layers = nn.ModuleList()
+        # 第一层：输入维度 -> hidden_dim (如果concat=True，总输出为 head_out * heads = hidden_dim)
+        self.layers.append(
+            GraphAttentionLayer(
+                in_channels=in_channels,
+                out_channels=head_out,
+                heads=heads,
+                concat=True,  # 第一层总是拼接
+                negative_slope=negative_slope,
+                dropout=dropout,
+                add_self_loops=add_self_loops,
+                edge_weight_scale=edge_weight_scale
+            )
+        )
+        # 中间层（如果有更多层）
+        for _ in range(n_layers - 2):
+            self.layers.append(
+                GraphAttentionLayer(
+                    in_channels=hidden_dim,
+                    out_channels=head_out,
+                    heads=heads,
+                    concat=True,
+                    negative_slope=negative_slope,
+                    dropout=dropout,
+                    add_self_loops=add_self_loops,
+                    edge_weight_scale=edge_weight_scale
+                )
+            )
+        # 最后一层：输出到 out_channels
+        if n_layers >= 2:
+            last_head_out = out_channels // heads if concat else out_channels
+            if concat and out_channels % heads != 0:
+                raise ValueError(f"out_channels ({out_channels}) 必须能被 heads ({heads}) 整除")
+            self.layers.append(
+                GraphAttentionLayer(
+                    in_channels=hidden_dim,
+                    out_channels=last_head_out,
+                    heads=heads,
+                    concat=concat,
+                    negative_slope=negative_slope,
+                    dropout=dropout,
+                    add_self_loops=add_self_loops,
+                    edge_weight_scale=edge_weight_scale
+                )
+            )
+        # 注意：n_layers=2时，只有第一层和最后一层
+
+        # 激活函数
+        self.activation = nn.LeakyReLU(negative_slope)
+        self.dropout_layer = nn.Dropout(dropout)
+
+    def forward(self,
+                node_features: torch.Tensor,
+                edge_index: torch.Tensor,
+                edge_attr: Optional[torch.Tensor] = None,
+                return_attention: bool = False) -> torch.Tensor:
+        """
+        前向传播
+
+        Args:
+            node_features: [N, in_channels]
+            edge_index: [2, E]
+            edge_attr: [E, 1] 边权重
+            return_attention: 是否返回每层的注意力系数列表
+
+        Returns:
+            节点嵌入 [N, out_channels] 或 (嵌入, 注意力列表)
+        """
+        x = node_features
+        attention_weights = []
+
+        for i, layer in enumerate(self.layers):
+            if i == len(self.layers) - 1:
+                # 最后一层：不返回注意力（或可以选择返回）
+                x = layer(x, edge_index, edge_attr, return_attention_weights=False)
+            else:
+                x = layer(x, edge_index, edge_attr, return_attention_weights=False)
+            # 激活函数和dropout（除了最后一层后可能不需要激活，取决于设计）
+            if i < len(self.layers) - 1:
+                x = self.activation(x)
+                x = self.dropout_layer(x)
+            # 如果需要收集注意力，但为了简化，我们选择在每层后调用compute_attention_weights
+            if return_attention:
+                att = layer.compute_attention_weights()
+                if att is not None:
+                    attention_weights.append(att)
+
+        if return_attention:
+            return x, attention_weights
+        else:
+            return x
+
+    def encode(self,
+               graph,
+               node_features: torch.Tensor,
+               edge_index: torch.Tensor,
+               edge_attr: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        与forward相同，提供更语义化的接口。
+        """
+        return self.forward(node_features, edge_index, edge_attr)
+
+    def extract_node_embeddings(self,
+                                 node_features: torch.Tensor,
+                                 edge_index: torch.Tensor,
+                                 edge_attr: Optional[torch.Tensor] = None,
+                                 nodes: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        提取指定节点的嵌入（若未指定则返回所有节点嵌入）。
+
+        Args:
+            node_features: [N, in_channels]
+            edge_index: [2, E]
+            edge_attr: [E, 1]
+            nodes: 节点索引张量，可选
+
+        Returns:
+            嵌入 [num_nodes, out_channels] 或 [len(nodes), out_channels]
+        """
+        embeddings = self.forward(node_features, edge_index, edge_attr)
+        if nodes is not None:
+            return embeddings[nodes]
+        return embeddings
+
+
+    # 参数配置（论文表2）
+    in_channels = 5  # 节点特征维度 [quality, access_freq, business_contrib, risk, cost]
+    hidden_dim = 128
+    out_channels = 128  # 最终输出维度
+    heads = 8
+    n_layers = 2
+    dropout = 0.3
+
+    # 初始化编码器
+    encoder = GATEncoder(
+        in_channels=in_channels,
+        hidden_dim=hidden_dim,
+        out_channels=out_channels,
+        heads=heads,
+        n_layers=n_layers,
+        dropout=dropout,
+        concat=True,
+        add_self_loops=True,
+        edge_weight_scale=True
+    )
+
+    num_nodes = 100
+    num_edges = 200
+    node_features = torch.randn(num_nodes, in_channels)
+    edge_index = torch.randint(0, num_nodes, (2, num_edges), dtype=torch.long)
+    edge_attr = torch.rand(num_edges, 1)  # 边权重在[0,1]
+
+    # 前向传播
+    embeddings = encoder.encode(node_features, edge_index, edge_attr)
+    print(f"节点嵌入形状: {embeddings.shape}")  # [100, 128]
+
+    # 提取指定节点嵌入
+    nodes = torch.tensor([0, 5, 10])
+    sub_embeddings = encoder.extract_node_embeddings(node_features, edge_index, edge_attr, nodes)
+    print(f"子节点嵌入形状: {sub_embeddings.shape}")  # [3, 128]
+
+    # 获取注意力权重（假设我们修改forward以返回）
+    # 为演示，我们调用并返回注意力
+    emb, att_list = encoder.forward(node_features, edge_index, edge_attr, return_attention=True)
+    print(f"注意力层数: {len(att_list)}")
+    if att_list:
+        print(f"第一层注意力形状: {att_list[0].shape}")  # [E, heads]
