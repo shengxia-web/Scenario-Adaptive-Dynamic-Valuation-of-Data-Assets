@@ -1,6 +1,5 @@
 """
 模块7：集成模型 (integrated_model.py)
-论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
 功能：将所有组件整合为完整的场景自适应动态模型。
       实现完整的前向传播：输入图 → GAT编码 → 场景适配 → GRU解码 → 值预测。
       支持注意力权重提取、损失计算、多步预测。
