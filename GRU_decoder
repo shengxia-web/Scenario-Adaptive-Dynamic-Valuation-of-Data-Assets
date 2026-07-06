@@ -1,0 +1,312 @@
+"""
+模块3：GRU解码器 (gru_decoder.py)
+论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
+功能：实现单层GRU用于时序建模，将GAT编码器输出的节点嵌入序列作为输入，
+     更新节点时序状态，支持未来状态预测。
+配置：64维隐层，1层，LeakyReLU激活。
+关键公式：h_i(t+1) = RNN( h_i(t), [m_i^{(c)}(t), x_i(t+1)] )
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple, List, Union
+
+
+class GRUDecoder(nn.Module):
+    """
+    单层GRU解码器，用于时序建模。
+    输入：每个时间步的节点嵌入（来自GAT编码器）和可选的外部特征（如观测特征）。
+    输出：每个时间步的更新后的隐状态。
+    支持预测未来多个时间步。
+    """
+
+    def __init__(self,
+                 input_dim: int,
+                 hidden_dim: int = 64,
+                 n_layers: int = 1,
+                 dropout: float = 0.0,
+                 activation: str = 'leaky_relu',
+                 negative_slope: float = 0.2,
+                 bidirectional: bool = False):
+        """
+        Args:
+            input_dim: 输入特征维度（GAT编码器输出维度 + 可能的额外特征维度）
+            hidden_dim: GRU隐层维度（论文设为64）
+            n_layers: GRU层数（论文设为1）
+            dropout: 层间dropout（如果n_layers>1有效）
+            activation: 激活函数类型，'leaky_relu' 或 'relu'
+            negative_slope: LeakyReLU的负斜率
+            bidirectional: 是否双向（论文为单向，保持False）
+        """
+        super(GRUDecoder, self).__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
+
+        # 定义激活函数
+        if activation.lower() == 'leaky_relu':
+            self.activation = nn.LeakyReLU(negative_slope=negative_slope)
+        elif activation.lower() == 'relu':
+            self.activation = nn.ReLU()
+        else:
+            raise ValueError(f"不支持的激活函数: {activation}")
+
+        # GRU层
+        self.gru = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=n_layers,
+            batch_first=True,
+            dropout=dropout if n_layers > 1 else 0.0,
+            bidirectional=bidirectional
+        )
+
+        # 可选的输出投影层（将GRU输出映射回需要的维度，此处用于后续预测）
+        self.proj = nn.Linear(hidden_dim * self.num_directions, hidden_dim)
+
+        # 存储中间隐状态（用于分析）
+        self._hidden_states = []
+
+    def forward(self,
+                encoder_outputs: torch.Tensor,
+                additional_features: Optional[torch.Tensor] = None,
+                initial_hidden: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        前向传播，处理时间序列。
+
+        Args:
+            encoder_outputs: [batch_size, seq_len, encoder_dim] 
+                            每个时间步的节点嵌入（来自GAT编码器），
+                            通常是所有节点的时间步序列。
+                            注意：论文中模型是对每个节点独立进行RNN更新，
+                            这里我们支持批量处理所有节点，时间步在第二维。
+            additional_features: [batch_size, seq_len, extra_dim] 可选的外部输入特征，
+                                 如观测特征 x_i(t) 或聚合消息 m_i(t)，可拼接作为输入。
+            initial_hidden: [n_layers * num_directions, batch_size, hidden_dim] 
+                            初始隐状态，默认为零。
+
+        Returns:
+            outputs: [batch_size, seq_len, hidden_dim] 每个时间步的输出隐状态
+            final_hidden: [n_layers * num_directions, batch_size, hidden_dim] 最终隐状态
+        """
+        # 如果提供了额外特征，在特征维度上拼接
+        if additional_features is not None:
+            if additional_features.shape[1] != encoder_outputs.shape[1]:
+                raise ValueError(f"时间步数不匹配: encoder_outputs {encoder_outputs.shape[1]} vs "
+                                 f"additional_features {additional_features.shape[1]}")
+            gru_input = torch.cat([encoder_outputs, additional_features], dim=-1)
+        else:
+            gru_input = encoder_outputs
+
+        # GRU前向
+        # gru_input: [batch_size, seq_len, input_dim]
+        outputs, final_hidden = self.gru(gru_input, initial_hidden)
+        # outputs: [batch_size, seq_len, hidden_dim * num_directions]
+        # final_hidden: [n_layers * num_directions, batch_size, hidden_dim]
+
+        # 投影到统一维度（如果双向，则线性变换）
+        outputs = self.proj(outputs)  # [batch_size, seq_len, hidden_dim]
+        outputs = self.activation(outputs)
+
+        # 存储隐状态（用于外部访问）
+        self._hidden_states = outputs.detach()
+
+        return outputs, final_hidden
+
+    def temporal_evolution(self,
+                           hidden_state: torch.Tensor,
+                           external_input: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        单步更新隐状态（用于递推生成下一个时间步的隐状态）。
+        此方法模拟公式：h(t+1) = RNN(h(t), [m(t), x(t+1)]) 的简化版，
+        但实际GRU的递推需要在循环中调用。
+
+        Args:
+            hidden_state: [batch_size, hidden_dim] 当前时间步的隐状态
+            external_input: [batch_size, input_dim] 当前时间步的输入（如新的观测特征和消息）
+
+        Returns:
+            next_hidden: [batch_size, hidden_dim] 下一个时间步的隐状态
+        """
+        # 如果提供了外部输入，则与隐状态拼接作为GRU输入
+        if external_input is not None:
+            # 需要将输入调整为序列长度为1
+            combined = external_input.unsqueeze(1)  # [batch_size, 1, input_dim]
+        else:
+            # 如果没有外部输入，则仅基于当前隐状态生成下一个？GRU需要输入，不能无输入。
+            # 这里我们假设使用零输入或投影隐状态
+            # 更合理的方式：将隐状态通过线性层映射为输入
+            # 但为了演示，我们使用隐状态本身作为输入（经投影）
+            combined = hidden_state.unsqueeze(1)  # [batch_size, 1, hidden_dim]
+
+        # 注意：GRU要求输入维度与初始化时定义的input_dim一致。
+        # 但这里我们无法知道输入维度，除非传递。我们重新定义单步函数需指定输入维度。
+        # 为简化，我们使用GRU的前向，但需要知道隐藏状态和输入。
+        # 由于GRU是递归的，我们使用torch的GRUCell更合适。
+        # 但为保持统一，我们在类中增加一个GRUCell。
+        # 下面我们使用GRUCell来实现单步更新。
+
+        # 我们实际在类中定义_gru_cell，但这里为了演示，我们直接在temporal_evolution中实例化。
+        # 由于我们已经定义了GRU层，更简单的是使用GRUCell作为单独成员。
+        # 我们在初始化中添加GRUCell。
+        # 但为了不改变初始化，我们在方法中动态创建？不推荐。
+        # 我们修改类，增加一个GRUCell成员。
+        # 因为本方法在外部被调用，我们需要保证可行。
+        # 因此在 __init__ 中我们加入 self.gru_cell = nn.GRUCell(input_dim, hidden_dim)
+        # 但注意input_dim可能变化。我们在__init__中传入，但forward中可能拼接额外特征导致实际输入维不同。
+        # 我们采用一个更统一的方案：forward使用GRU，temporal_evolution使用GRUCell，输入维度固定为hidden_dim（即解码器只接受隐状态作为输入）。
+        # 实际上论文中GRU的输入是 [m_i(t), x_i(t+1)]，其维度是 (message_dim + feature_dim)，通常不等于hidden_dim。
+        # 因此，我们应当将 [m, x] 通过一个线性层映射到 hidden_dim，再输入GRU。
+        # 为了简化实现，我们将temporal_evolution设计为接受一个已编码的输入向量（维度等于input_dim），然后使用GRUCell。
+
+        # 由于我们的GRUDecoder已经定义了GRU层，我们也可以利用它进行单步，但需要将序列长度设为1。
+        # 更简单：我们使用self.gru的循环递推，但需要处理隐状态。
+        # 我们采用如下方法：
+        if hasattr(self, '_gru_cell'):
+            # 使用GRUCell
+            if external_input is not None:
+                input_vec = external_input  # [batch_size, input_dim]
+            else:
+                input_vec = hidden_state  # 用隐状态作为输入（降维）
+                # 若输入维度不同，需投影
+                if not hasattr(self, '_proj_to_input'):
+                    self._proj_to_input = nn.Linear(hidden_dim, self.input_dim)
+                input_vec = self._proj_to_input(hidden_state)
+            next_h = self._gru_cell(input_vec, hidden_state)
+            return next_h
+        else:
+            # 若没有GRUCell，则利用GRU forward处理序列长度为1的情况
+            # 将输入扩展为 [batch_size, 1, input_dim]
+            if external_input is not None:
+                inp = external_input.unsqueeze(1)
+            else:
+                inp = hidden_state.unsqueeze(1)
+                # 需要投影到input_dim（如果维度不匹配）
+                if inp.shape[-1] != self.input_dim:
+                    if not hasattr(self, '_in_proj'):
+                        self._in_proj = nn.Linear(hidden_dim, self.input_dim)
+                    inp = self._in_proj(inp)
+            # 初始隐状态为当前隐状态，但需要增加层维度
+            h0 = hidden_state.unsqueeze(0)  # [1, batch, hidden]
+            if self.n_layers > 1:
+                h0 = h0.repeat(self.n_layers, 1, 1)
+            # 调用GRU
+            out, h_n = self.gru(inp, h0)  # out: [batch, 1, hidden*dir], h_n: [layers*dir, batch, hidden]
+            next_h = h_n[-1]  # 取最后一层
+            return next_h
+
+    def predict_future_states(self,
+                              initial_hidden: torch.Tensor,
+                              n_steps: int,
+                              external_inputs: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        自回归预测未来n_steps个时间步的隐状态。
+
+        Args:
+            initial_hidden: [batch_size, hidden_dim] 当前时间步的隐状态
+            n_steps: 预测步数
+            external_inputs: [batch_size, n_steps, input_dim] 未来各步的外部输入（若有）
+
+        Returns:
+            future_states: [batch_size, n_steps, hidden_dim] 未来各步隐状态
+        """
+        batch_size = initial_hidden.size(0)
+        device = initial_hidden.device
+        future_states = []
+
+        # 当前隐状态
+        h_t = initial_hidden
+
+        for step in range(n_steps):
+            # 获取外部输入（如果有）
+            if external_inputs is not None:
+                ext_input = external_inputs[:, step, :]  # [batch_size, input_dim]
+            else:
+                ext_input = None
+
+            # 单步更新
+            h_t = self.temporal_evolution(h_t, ext_input)
+            future_states.append(h_t)
+
+        # 堆叠 [batch_size, n_steps, hidden_dim]
+        return torch.stack(future_states, dim=1)
+
+    def reset_hidden_states(self):
+        """清空存储的隐状态（用于分析或调试）"""
+        self._hidden_states = []
+
+    def get_hidden_states(self) -> Optional[torch.Tensor]:
+        """返回最近一次前向传播的隐状态序列"""
+        return self._hidden_states
+
+
+# 为了更精确实现单步更新，我们扩展一个带有GRUCell的版本
+class GRUDecoderWithCell(GRUDecoder):
+    """
+    扩展版本，包含GRUCell以支持更高效的单步更新。
+    """
+    def __init__(self,
+                 input_dim: int,
+                 hidden_dim: int = 64,
+                 n_layers: int = 1,
+                 dropout: float = 0.0,
+                 activation: str = 'leaky_relu',
+                 negative_slope: float = 0.2):
+        super().__init__(input_dim, hidden_dim, n_layers, dropout, activation, negative_slope)
+        # 添加GRUCell
+        self.gru_cell = nn.GRUCell(input_dim, hidden_dim)
+        # 如果有多层，每层都需要cell，但论文单层，故只用一个
+
+    def temporal_evolution(self,
+                           hidden_state: torch.Tensor,
+                           external_input: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        使用GRUCell进行单步更新。
+        """
+        if external_input is not None:
+            input_vec = external_input
+        else:
+            # 若没有外部输入，使用零向量（或可学习的默认输入）
+            # 论文中每步都有输入，故这里仅作防御
+            input_vec = torch.zeros(hidden_state.size(0), self.input_dim, device=hidden_state.device)
+        return self.gru_cell(input_vec, hidden_state)
+
+if __name__ == "__main__":
+    # 参数配置（论文表2）
+    encoder_dim = 128   # GAT编码器输出维度
+    hidden_dim = 64     # GRU隐层维度
+    seq_len = 5         # 时间步数
+    batch_size = 32     # 节点数（或批量）
+
+    # 创建解码器（使用带Cell的版本）
+    decoder = GRUDecoderWithCell(
+        input_dim=encoder_dim,   # 输入是GAT输出，假设直接输入
+        hidden_dim=hidden_dim,
+        n_layers=1,
+        activation='leaky_relu'
+    )
+
+    # 输入：encoder_outputs [batch_size, seq_len, encoder_dim]
+    encoder_outputs = torch.randn(batch_size, seq_len, encoder_dim)
+
+    # 前向传播
+    outputs, final_hidden = decoder.forward(encoder_outputs)
+    print(f"输出形状: {outputs.shape}")  # [32, 5, 64]
+    print(f"最终隐状态形状: {final_hidden.shape}")  # [1, 32, 64]
+
+    # 单步更新测试
+    current_hidden = final_hidden.squeeze(0)  # [32, 64]
+    next_input = torch.randn(batch_size, encoder_dim)  # 新的外部输入（如聚合消息和观测特征）
+    next_hidden = decoder.temporal_evolution(current_hidden, next_input)
+    print(f"单步更新后隐状态形状: {next_hidden.shape}")  # [32, 64]
+
+    # 预测未来5步
+    future = decoder.predict_future_states(current_hidden, n_steps=5)
+    print(f"预测未来状态形状: {future.shape}")  # [32, 5, 64]
+
+    # 获取存储的隐状态
+    print(f"存储的隐状态形状: {decoder.get_hidden_states().shape}")
