@@ -1,6 +1,5 @@
 """
 模块2：GAT编码器 (gat_encoder.py)
-论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
 功能：实现多头图注意力网络编码器，作为空间消息传递组件。
 配置：2层，128维隐层，8头注意力，0.3 dropout，LeakyReLU激活。
 支持边权重作为注意力偏置（论文公式6）。
