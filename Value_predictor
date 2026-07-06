@@ -1,6 +1,5 @@
 """
 模块6：值预测头 (value_predictor.py)
-论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
 功能：预测数据资产动态价值 v_i(t)，输出价值评分。
 支持单步预测和多步预测（例如10步预测地平线）。
 将节点隐状态映射为实数值，并可结合时间序列预测未来价值演化。
