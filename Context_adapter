@@ -1,6 +1,5 @@
 """
 模块4：场景自适应器 (context_adapter.py)
-论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
 功能：
 1. 编码业务场景和外部环境信息为上下文嵌入向量 z^{(c)}
 2. 根据场景自适应地重加权节点特征（实现场景感知的特征重要性调整）
