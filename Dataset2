@@ -1,0 +1,513 @@
+"""
+OpenDataVal 数据集预处理全流程
+论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
+参考：OpenDataVal (NeurIPS 2023 Datasets and Benchmarks Track)
+"""
+
+import os
+import json
+import numpy as np
+import pandas as pd
+import torch
+from typing import Dict, List, Tuple, Optional, Union
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==================== 1. OpenDataVal 依赖导入 ====================
+# 安装: pip install opendataval
+# 论文代码测试于 OpenDataVal 1.3.0，Python 3.9[reference:2]
+try:
+    import opendataval
+    from opendataval.dataloader import DataFetcher, Dataset, add_noise
+    from opendataval.dataloader.datasets import (
+        fetch_iris, fetch_breast_cancer, fetch_diabetes, fetch_wine,
+        fetch_california_housing, fetch_adult, fetch_credit_card,
+        fetch_bank_marketing, fetch_magic_telescope, fetch_skin_segmentation,
+        fetch_optical_digits, fetch_pendigits, fetch_letter_recognition,
+        fetch_satellite, fetch_vehicle, fetch_abalone, fetch_energy,
+        fetch_airfoil, fetch_concrete, fetch_wine_quality_red,
+        fetch_wine_quality_white, fetch_yacht, fetch_cifar10_embeddings,
+        fetch_cifar100_embeddings, fetch_mnist_embeddings,
+        fetch_fashion_mnist_embeddings, fetch_svhn_embeddings,
+        fetch_imdb_embeddings, fetch_sst2_embeddings, fetch_ag_news_embeddings,
+        fetch_dbpedia_embeddings
+    )
+    from opendataval.dataval import (
+        DataShapley, KNNShapley, BetaShapley, BanzhafValue,
+        AME, DVRL, InfluenceFunction, DataOob,
+        LeaveOneOut, LavaEvaluator
+    )
+    from opendataval.model import LogisticRegressionModel, RandomForestModel
+    from opendataval.experiment import ExperimentMediator
+except ImportError as e:
+    print(f"请先安装 OpenDataVal: pip install opendataval")
+    print(f"导入错误: {e}")
+    raise
+
+# ==================== 2. 配置参数 ====================
+OUTPUT_ROOT = "./processed/OpenDataVal"
+RANDOM_SEED = 42
+TEST_SIZE = 0.2
+VAL_SIZE = 0.1  # 验证集比例
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+
+# OpenDataVal 数据集注册表（33个数据集，按模态分类）[reference:3]
+# 表格数据集 (22个)
+TABULAR_DATASETS = {
+    'iris': fetch_iris,
+    'breast_cancer': fetch_breast_cancer,
+    'diabetes': fetch_diabetes,
+    'wine': fetch_wine,
+    'california_housing': fetch_california_housing,
+    'adult': fetch_adult,
+    'credit_card': fetch_credit_card,
+    'bank_marketing': fetch_bank_marketing,
+    'magic_telescope': fetch_magic_telescope,
+    'skin_segmentation': fetch_skin_segmentation,
+    'optical_digits': fetch_optical_digits,
+    'pendigits': fetch_pendigits,
+    'letter_recognition': fetch_letter_recognition,
+    'satellite': fetch_satellite,
+    'vehicle': fetch_vehicle,
+    'abalone': fetch_abalone,
+    'energy': fetch_energy,
+    'airfoil': fetch_airfoil,
+    'concrete': fetch_concrete,
+    'wine_quality_red': fetch_wine_quality_red,
+    'wine_quality_white': fetch_wine_quality_white,
+    'yacht': fetch_yacht
+}
+
+# 图像数据集 (7个) - 使用预训练嵌入
+IMAGE_DATASETS = {
+    'cifar10_embeddings': fetch_cifar10_embeddings,
+    'cifar100_embeddings': fetch_cifar100_embeddings,
+    'mnist_embeddings': fetch_mnist_embeddings,
+    'fashion_mnist_embeddings': fetch_fashion_mnist_embeddings,
+    'svhn_embeddings': fetch_svhn_embeddings,
+}
+
+# 自然语言数据集 (4个) - 使用预训练嵌入
+NLP_DATASETS = {
+    'imdb_embeddings': fetch_imdb_embeddings,
+    'sst2_embeddings': fetch_sst2_embeddings,
+    'ag_news_embeddings': fetch_ag_news_embeddings,
+    'dbpedia_embeddings': fetch_dbpedia_embeddings
+}
+
+ALL_DATASETS = {**TABULAR_DATASETS, **IMAGE_DATASETS, **NLP_DATASETS}
+
+# ==================== 3. OpenDataVal 数据加载与预处理 ====================
+def load_opendataval_dataset(dataset_name: str) -> Dict:
+    """
+    使用 OpenDataVal 的 DataFetcher 加载数据集。
+    返回包含特征、标签、数据集名称和模态信息的字典。
+    """
+    if dataset_name not in ALL_DATASETS:
+        raise ValueError(f"未知数据集: {dataset_name}. 可用数据集: {list(ALL_DATASETS.keys())}")
+    
+    fetch_func = ALL_DATASETS[dataset_name]
+    
+    # OpenDataVal 数据集通过 DataFetcher 加载
+    # 每个数据集返回 (x_data, y_data) 或类似结构
+    try:
+        # 标准 OpenDataVal 加载方式
+        data = fetch_func()
+        if hasattr(data, 'x'):
+            X = data.x
+            y = data.y
+        elif hasattr(data, 'data') and hasattr(data, 'target'):
+            X = data.data
+            y = data.target
+        else:
+            # 尝试作为元组处理
+            X, y = data
+    except Exception as e:
+        print(f"使用 DataFetcher 加载 {dataset_name} 失败: {e}")
+        # 降级方案：使用 OpenDataVal 的 DataFetcher
+        from opendataval.dataloader import DataFetcher
+        fetcher = DataFetcher(dataset_name)
+        X, y = fetcher.fetch()
+    
+    # 转换为 numpy 数组
+    if torch.is_tensor(X):
+        X = X.numpy()
+    if torch.is_tensor(y):
+        y = y.numpy()
+    
+    # 确定模态类型
+    if dataset_name in TABULAR_DATASETS:
+        modality = 'tabular'
+    elif dataset_name in IMAGE_DATASETS:
+        modality = 'image'
+    elif dataset_name in NLP_DATASETS:
+        modality = 'nlp'
+    else:
+        modality = 'unknown'
+    
+    return {
+        'X': X,
+        'y': y,
+        'name': dataset_name,
+        'modality': modality,
+        'n_samples': len(X),
+        'n_features': X.shape[1] if len(X.shape) > 1 else 1
+    }
+
+# ==================== 4. 特征工程与标准化 ====================
+def preprocess_features(X: np.ndarray, y: np.ndarray, 
+                        scaler: Optional[StandardScaler] = None,
+                        label_encoder: Optional[LabelEncoder] = None) -> Dict:
+    """
+    特征预处理：
+    1. 标签编码（分类标签转换为数值）
+    2. 特征标准化 (Z-score)
+    3. 处理缺失值（中位数填充）
+    """
+    X_processed = X.copy()
+    y_processed = y.copy()
+    
+    # 处理标签：如果是字符串类型，进行编码
+    if y_processed.dtype == object or y_processed.dtype == np.str_:
+        if label_encoder is None:
+            label_encoder = LabelEncoder()
+            y_processed = label_encoder.fit_transform(y_processed)
+        else:
+            y_processed = label_encoder.transform(y_processed)
+    else:
+        # 确保标签为整数类型
+        y_processed = y_processed.astype(np.int64)
+    
+    # 处理特征中的缺失值
+    if np.any(np.isnan(X_processed)):
+        for col in range(X_processed.shape[1]):
+            col_data = X_processed[:, col]
+            if np.any(np.isnan(col_data)):
+                median_val = np.nanmedian(col_data)
+                col_data[np.isnan(col_data)] = median_val
+                X_processed[:, col] = col_data
+    
+    # 特征标准化
+    if scaler is None:
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_processed)
+    else:
+        X_scaled = scaler.transform(X_processed)
+    
+    return {
+        'X': X_scaled,
+        'y': y_processed,
+        'scaler': scaler,
+        'label_encoder': label_encoder,
+        'n_classes': len(np.unique(y_processed))
+    }
+
+# ==================== 5. 数据划分（训练/验证/测试） ====================
+def split_dataset(X: np.ndarray, y: np.ndarray, 
+                  test_size: float = TEST_SIZE,
+                  val_size: float = VAL_SIZE,
+                  random_state: int = RANDOM_SEED) -> Dict:
+    """
+    按分层抽样划分数据集为训练集、验证集、测试集。
+    """
+    # 首先划分训练+验证 和 测试
+    X_train_val, X_test, y_train_val, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=y
+    )
+    
+    # 从训练+验证中划分验证集
+    val_ratio = val_size / (1 - test_size)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train_val, y_train_val, test_size=val_ratio, 
+        random_state=random_state, stratify=y_train_val
+    )
+    
+    return {
+        'X_train': X_train,
+        'X_val': X_val,
+        'X_test': X_test,
+        'y_train': y_train,
+        'y_val': y_val,
+        'y_test': y_test,
+        'train_size': len(X_train),
+        'val_size': len(X_val),
+        'test_size': len(X_test)
+    }
+
+# ==================== 6. 数据估值算法集成 ====================
+def setup_data_valuator(algorithm_name: str, model, **kwargs):
+    """
+    配置 OpenDataVal 中实现的11种数据估值算法[reference:5]。
+    包括: DataShapley, KNNShapley, BetaShapley, BanzhafValue,
+          AME, DVRL, InfluenceFunction, DataOob, LeaveOneOut, LavaEvaluator
+    """
+    algorithms = {
+        'DataShapley': DataShapley,
+        'KNNShapley': KNNShapley,
+        'BetaShapley': BetaShapley,
+        'BanzhafValue': BanzhafValue,
+        'AME': AME,
+        'DVRL': DVRL,
+        'InfluenceFunction': InfluenceFunction,
+        'DataOob': DataOob,
+        'LeaveOneOut': LeaveOneOut,
+        'LavaEvaluator': LavaEvaluator
+    }
+    
+    if algorithm_name not in algorithms:
+        raise ValueError(f"未知算法: {algorithm_name}. 可用: {list(algorithms.keys())}")
+    
+    # 初始化估值器
+    evaluator_class = algorithms[algorithm_name]
+    evaluator = evaluator_class(model=model, **kwargs)
+    
+    return evaluator
+
+# ==================== 7. 完整预处理流程 ====================
+def preprocess_opendataval_dataset(dataset_name: str, 
+                                   algorithm_name: str = 'DataShapley',
+                                   save_output: bool = True) -> Dict:
+    """
+    单个 OpenDataVal 数据集的完整预处理流程。
+    """
+    print(f"\n{'='*60}")
+    print(f"处理数据集: {dataset_name}")
+    print(f"估值算法: {algorithm_name}")
+    print(f"{'='*60}")
+    
+    # Step 1: 加载原始数据
+    raw_data = load_opendataval_dataset(dataset_name)
+    X_raw, y_raw = raw_data['X'], raw_data['y']
+    print(f"原始数据形状: X={X_raw.shape}, y={y_raw.shape}")
+    print(f"模态: {raw_data['modality']}")
+    
+    # Step 2: 特征预处理
+    preprocessed = preprocess_features(X_raw, y_raw)
+    X, y = preprocessed['X'], preprocessed['y']
+    scaler = preprocessed['scaler']
+    label_encoder = preprocessed['label_encoder']
+    print(f"预处理后特征维度: {X.shape[1]}")
+    print(f"类别数: {preprocessed['n_classes']}")
+    
+    # Step 3: 数据划分
+    splits = split_dataset(X, y)
+    print(f"训练集: {splits['train_size']}, 验证集: {splits['val_size']}, 测试集: {splits['test_size']}")
+    
+    # Step 4: 配置预测模型（用于数据估值）
+    # 根据数据集规模和模态选择合适的模型
+    if raw_data['modality'] == 'tabular':
+        if splits['train_size'] < 1000:
+            model = LogisticRegression(max_iter=5000, random_state=RANDOM_SEED)
+        else:
+            model = RandomForestClassifier(n_estimators=100, random_state=RANDOM_SEED)
+    else:
+        # 图像/NLP使用简单模型
+        model = LogisticRegression(max_iter=5000, random_state=RANDOM_SEED)
+    
+    # Step 5: 设置数据估值器
+    try:
+        evaluator = setup_data_valuator(algorithm_name, model)
+        print(f"数据估值器初始化成功: {algorithm_name}")
+    except Exception as e:
+        print(f"估值器初始化失败: {e}")
+        evaluator = None
+    
+    # Step 6: 构建结果字典
+    results = {
+        'dataset_name': dataset_name,
+        'modality': raw_data['modality'],
+        'algorithm': algorithm_name,
+        'X_train': splits['X_train'],
+        'X_val': splits['X_val'],
+        'X_test': splits['X_test'],
+        'y_train': splits['y_train'],
+        'y_val': splits['y_val'],
+        'y_test': splits['y_test'],
+        'scaler': scaler,
+        'label_encoder': label_encoder,
+        'n_features': X.shape[1],
+        'n_classes': preprocessed['n_classes'],
+        'n_samples': raw_data['n_samples'],
+        'evaluator': evaluator,
+        'raw_data': raw_data
+    }
+    
+    # Step 7: 保存结果
+    if save_output:
+        save_preprocessed_data(results, dataset_name, algorithm_name)
+    
+    return results
+
+# ==================== 8. 保存与加载预处理数据 ====================
+def save_preprocessed_data(results: Dict, dataset_name: str, algorithm_name: str):
+    """
+    保存预处理后的数据到磁盘。
+    """
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    dataset_dir = os.path.join(OUTPUT_ROOT, dataset_name)
+    os.makedirs(dataset_dir, exist_ok=True)
+    
+    # 保存特征和标签
+    np.save(os.path.join(dataset_dir, 'X_train.npy'), results['X_train'])
+    np.save(os.path.join(dataset_dir, 'X_val.npy'), results['X_val'])
+    np.save(os.path.join(dataset_dir, 'X_test.npy'), results['X_test'])
+    np.save(os.path.join(dataset_dir, 'y_train.npy'), results['y_train'])
+    np.save(os.path.join(dataset_dir, 'y_val.npy'), results['y_val'])
+    np.save(os.path.join(dataset_dir, 'y_test.npy'), results['y_test'])
+    
+    # 保存元数据
+    metadata = {
+        'dataset_name': results['dataset_name'],
+        'modality': results['modality'],
+        'algorithm': results['algorithm'],
+        'n_features': results['n_features'],
+        'n_classes': results['n_classes'],
+        'n_samples': results['n_samples'],
+        'train_size': len(results['X_train']),
+        'val_size': len(results['X_val']),
+        'test_size': len(results['X_test']),
+        'random_seed': RANDOM_SEED
+    }
+    with open(os.path.join(dataset_dir, 'metadata.json'), 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"数据已保存至: {dataset_dir}")
+
+def load_preprocessed_data(dataset_name: str) -> Dict:
+    """
+    加载已预处理的 OpenDataVal 数据集。
+    """
+    dataset_dir = os.path.join(OUTPUT_ROOT, dataset_name)
+    
+    with open(os.path.join(dataset_dir, 'metadata.json'), 'r') as f:
+        metadata = json.load(f)
+    
+    return {
+        'X_train': np.load(os.path.join(dataset_dir, 'X_train.npy')),
+        'X_val': np.load(os.path.join(dataset_dir, 'X_val.npy')),
+        'X_test': np.load(os.path.join(dataset_dir, 'X_test.npy')),
+        'y_train': np.load(os.path.join(dataset_dir, 'y_train.npy')),
+        'y_val': np.load(os.path.join(dataset_dir, 'y_val.npy')),
+        'y_test': np.load(os.path.join(dataset_dir, 'y_test.npy')),
+        'metadata': metadata
+    }
+
+# ==================== 9. 批量预处理所有数据集 ====================
+def preprocess_all_datasets(algorithm_name: str = 'DataShapley',
+                            dataset_subset: Optional[List[str]] = None):
+    """
+    批量预处理 OpenDataVal 中的所有33个数据集。
+    """
+    if dataset_subset is None:
+        dataset_subset = list(ALL_DATASETS.keys())
+    
+    results = {}
+    for dataset_name in dataset_subset:
+        try:
+            result = preprocess_opendataval_dataset(dataset_name, algorithm_name)
+            results[dataset_name] = result
+        except Exception as e:
+            print(f"处理 {dataset_name} 失败: {e}")
+            continue
+    
+    # 保存汇总报告
+    summary = {
+        'processed_datasets': list(results.keys()),
+        'total_datasets': len(results),
+        'algorithm': algorithm_name,
+        'tabular_datasets': [d for d, r in results.items() if r['modality'] == 'tabular'],
+        'image_datasets': [d for d, r in results.items() if r['modality'] == 'image'],
+        'nlp_datasets': [d for d, r in results.items() if r['modality'] == 'nlp']
+    }
+    
+    with open(os.path.join(OUTPUT_ROOT, 'preprocessing_summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    print(f"\n{'='*60}")
+    print(f"批量预处理完成!")
+    print(f"成功处理: {len(results)} 个数据集")
+    print(f"汇总报告: {os.path.join(OUTPUT_ROOT, 'preprocessing_summary.json')}")
+    print(f"{'='*60}")
+    
+    return results
+
+# ==================== 10. 数据估值实验执行 ====================
+def run_valuation_experiment(dataset_name: str, algorithm_name: str = 'DataShapley'):
+    """
+    使用 OpenDataVal 的 ExperimentMediator 执行完整的数据估值实验[reference:6]。
+    """
+    # 加载预处理数据
+    data = load_preprocessed_data(dataset_name)
+    X_train, y_train = data['X_train'], data['y_train']
+    X_test, y_test = data['X_test'], data['y_test']
+    
+    # 配置预测模型
+    if len(X_train) < 1000:
+        model = LogisticRegression(max_iter=5000, random_state=RANDOM_SEED)
+    else:
+        model = RandomForestClassifier(n_estimators=100, random_state=RANDOM_SEED)
+    
+    # 训练基础模型
+    model.fit(X_train, y_train)
+    base_accuracy = accuracy_score(y_test, model.predict(X_test))
+    print(f"基础模型测试准确率: {base_accuracy:.4f}")
+    
+    # 配置数据估值器
+    evaluator = setup_data_valuator(algorithm_name, model)
+    
+    # 执行数据估值
+    try:
+        # OpenDataVal 估值器接口: .compute_data_values() 计算每个数据点的价值
+        data_values = evaluator.compute_data_values(X_train, y_train)
+        print(f"数据估值完成，共 {len(data_values)} 个数据点")
+    except Exception as e:
+        print(f"数据估值执行失败: {e}")
+        data_values = None
+    
+    return {
+        'dataset': dataset_name,
+        'algorithm': algorithm_name,
+        'base_accuracy': base_accuracy,
+        'data_values': data_values,
+        'n_train': len(X_train),
+        'n_test': len(X_test)
+    }
+
+# ==================== 11. 主程序入口 ====================
+if __name__ == "__main__":
+    print("="*60)
+    print("OpenDataVal 数据集预处理流水线")
+    print("论文: A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets")
+    print("="*60)
+    
+    # 示例1: 处理单个数据集（表格数据）
+    print("\n[示例1] 处理单个表格数据集: iris")
+    iris_results = preprocess_opendataval_dataset('iris', 'DataShapley')
+    
+    # 示例2: 处理单个数据集（图像嵌入）
+    print("\n[示例2] 处理图像嵌入数据集: cifar10_embeddings")
+    cifar_results = preprocess_opendataval_dataset('cifar10_embeddings', 'KNNShapley')
+    
+    # 示例3: 处理单个数据集（NLP嵌入）
+    print("\n[示例3] 处理NLP嵌入数据集: imdb_embeddings")
+    imdb_results = preprocess_opendataval_dataset('imdb_embeddings', 'BetaShapley')
+    
+    # 示例4: 执行数据估值实验
+    print("\n[示例4] 执行数据估值实验")
+    exp_results = run_valuation_experiment('iris', 'DataShapley')
+    
+    # 示例5: 批量处理所有数据集（可选，耗时较长）
+    # 取消注释以下代码以批量处理全部33个数据集
+    # print("\n[示例5] 批量处理所有33个数据集")
+    # all_results = preprocess_all_datasets('DataShapley')
+    
+    print("\n" + "="*60)
+    print("预处理完成！")
+    print(f"输出目录: {OUTPUT_ROOT}")
+    print("="*60)
