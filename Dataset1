@@ -1,6 +1,5 @@
 """
 DataAssetGraphData (DLG-DR-23) 预处理全流程
-论文：A Scenario-Adaptive Graph-Based Model for Dynamic Valuation of Data Assets
 """
 
 import os
